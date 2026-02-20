@@ -22,7 +22,7 @@ async function multiDb (params) {
     try {
       if (multiDb.drivers[key] === '@electric-sql/pglite') {
         multiDb.drivers[key] = await import(multiDb.drivers[key])
-      } else if (Object.prototype.hasOwnProperty.call(multiDb.drivers[key], 'PGlite')) {
+      } else if (Object.getPrototypeOf(multiDb.drivers[key]) === null) {
         // do  nothing
       } else {
         multiDb.drivers[key] = require(multiDb.drivers[key])
