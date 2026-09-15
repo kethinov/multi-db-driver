@@ -1,3 +1,9 @@
+## 1.2.2
+
+- Fixed a bug that caused the message logged on a successful database connection to print `[Function: bold]` instead of naming the user and database that were connected to.
+- Fixed a bug that left `db.driver` and each `db.[database].driver` undefined instead of exposing the loaded driver module as documented.
+- Simplified much of the code and removed some dependencies.
+
 ## 1.2.1
 
 - Fixed a bug that prevented Multi-DB Driver from being loaded at all in contexts where `process.argv[1]` is undefined, such as the Node REPL or `node -e`.

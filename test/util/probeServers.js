@@ -2,7 +2,7 @@ const net = require('net')
 
 // probe each server-backed engine and report whether it is absent, running but rejecting the suite's credentials, or usable
 //
-// this runs as a child process so that the fixture can get an answer synchronously: mocha decides which suites exist while it is still loading the test files, long before any hook has had a chance to await anything
+// this runs as a child process so that the fixture can get an answer synchronously: the test runner decides which suites exist while it is still loading the test files, long before any hook has had a chance to await anything
 //
 // usage: node probeServers.js '<json map of engine to { config, adminConfig }>'
 
