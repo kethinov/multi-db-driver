@@ -2,9 +2,6 @@
 process.env.MULTI_DB_DRIVER_CONFIG_FILE_SEARCH_ATTEMPTS = 1 // set config search attempts to 1 by default
 const assert = require('assert')
 const fs = require('fs')
-const isDocker = process.argv.includes('--docker') || false
-const Logger = require('roosevelt-logger')
-const logger = new Logger()
 const multiDb = require('../multi-db-driver')
 const os = require('os')
 const path = require('path')
@@ -17,11 +14,16 @@ const destroyedDatabaseCheck = require(path.join(__dirname, './util/destroyedDat
 const dumpData = require(path.join(__dirname, './util/dumpData.js'))
 const dumpSchema = require(path.join(__dirname, './util/dumpSchema.js'))
 const executeSqlFile = require(path.join(__dirname, './util/executeSqlFile.js'))
+const fixture = require(path.join(__dirname, './util/fixture.js'))
+const reportPrerequisites = require(path.join(__dirname, './util/reportPrerequisites.js'))
 const runQueryWithInvalidSyntax = require(path.join(__dirname, './util/runQueryWithInvalidSyntax.js'))
-const startMariaDbContainer = require(path.join(__dirname, './util/startMariadbContainer.js'))
-const startMySqlContainer = require(path.join(__dirname, './util/startMysqlContainer.js'))
-const startPostgresContainer = require(path.join(__dirname, './util/startPostgresContainer.js'))
-const startSqliteContainer = require(path.join(__dirname, './util/startSqliteContainer.js'))
+
+// only register a suite or test when this run has a server for the engine it needs, so that a missing database is reported as a skip rather than quietly passing because the connection failed for the wrong reason
+const describeIf = engine => fixture.available(engine) ? describe : describe.skip
+const itIf = engine => fixture.available(engine) ? it : it.skip
+
+// the dump commands shell out, so their tests need the binary installed as well as the engine reachable. without this they would pass for the wrong reason: a missing binary errors just like a failed dump does
+const itIfDump = engine => fixture.canDump(engine) ? it : it.skip
 
 // values to be used in tests
 const values = [
@@ -31,36 +33,19 @@ const values = [
 ]
 
 before(async function () {
-  if (isDocker) {
-    const dockerCheck = spawnSync('docker', ['info'], { shell: false })
-    if (dockerCheck.error || dockerCheck.stderr?.toString().includes('ERROR: Cannot connect to the Docker daemon')) {
-      logger.error('🐳', 'Make sure Docker is installed and running...')
-      if (dockerCheck.error) logger.error(dockerCheck.error)
-      if (dockerCheck.stderr?.toString()) logger.error(dockerCheck.stderr.toString())
-      process.exit(1)
-    } else {
-      logger.log('🦭', 'Starting MariaDB container...')
-      const mdb = await startMariaDbContainer()
-      logger.log('✅', mdb + '\n')
-      logger.log('🐬', 'Starting MySQL container...')
-      const mysql = await startMySqlContainer()
-      logger.log('✅', mysql + '\n')
-      logger.log('🐘', 'Starting PostgreSQL container...')
-      const pg = await startPostgresContainer()
-      logger.log('✅', pg + '\n')
-      logger.log('🪶', 'Starting SQLite container...')
-      const sqlite = await startSqliteContainer()
-      logger.log('✅', sqlite + '\n')
-    }
-  }
+  await fixture.start()
+  await reportPrerequisites() // say plainly what this machine cannot test, and how to fix it
   require(createConfigs)()
 })
 
 after(async function () {
-  await destroyDatabase('mysql')
-  await destroyDatabase('pglite')
-  await destroyDatabase('postgres')
-  await destroyDatabase('sqlite')
+  // the generated config is missing if the before hook failed, in which case there is nothing to tear down but the servers themselves
+  if (fs.existsSync(path.normalize('.multi-db-driver-config.json'))) {
+    for (const engine of ['mysql', 'pglite', 'postgres', 'sqlite']) {
+      if (fixture.available(engine)) await destroyDatabase(engine)
+    }
+  }
+  await fixture.stop()
   cleanUp()
 })
 
@@ -72,7 +57,7 @@ process.on('SIGINT', () => {
 
 // CLI tests
 describe('CLI', function () {
-  it('should run --create CLI script and create MariaDB user, database and table', async function () {
+  itIf('mariadb')('should run --create CLI script and create MariaDB user, database and table', async function () {
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
     const result = await createDatabase('mariadb', false, true) // create database
     await destroyDatabase('mariadb') // destroy database
@@ -80,28 +65,16 @@ describe('CLI', function () {
     assert.equal(result, 'created') // check if result equals 'created'
   })
 
-  it('should run --destroy CLI script and destroy MariaDB database', async function () {
+  itIf('mariadb')('should run --destroy CLI script and destroy MariaDB database', async function () {
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
     await createDatabase('mariadb') // create database
     const droppedDatabase = await destroyDatabase('mariadb') // destroy database
-    if (isDocker) {
-      const mariaDbConfig = JSON.parse(fs.readFileSync(path.normalize('./test/configs/.mariadb-config.json')))
-      mariaDbConfig.mariadb.config.port = 3317
-      mariaDbConfig.mariadb.adminConfig.port = 3317
-      fs.writeFileSync(path.normalize('./test/configs/.mariadb-config.json'), JSON.stringify(mariaDbConfig, null, 2))
-    }
     const result = await destroyedDatabaseCheck('mariadb', droppedDatabase) // destroy database
-    if (isDocker) {
-      const mariadbDbConfig = JSON.parse(fs.readFileSync(path.normalize('./test/configs/.mariadb-config.json')))
-      mariadbDbConfig.mariadb.config.port = 3306
-      mariadbDbConfig.mariadb.adminConfig.port = 3306
-      fs.writeFileSync(path.normalize('./test/configs/.mariadb-config.json'), JSON.stringify(mariadbDbConfig, null, 2))
-    }
     delete process.env.MULTI_DB_DRIVER_CONFIG_LOCATION // delete env var
     assert.equal(result, 'destroyed') // check if result equals 'destroyed'
   })
 
-  it('should run --file CLI script against a MariaDB database', async function () {
+  itIf('mariadb')('should run --file CLI script against a MariaDB database', async function () {
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
     await createDatabase('mariadb') // create database
     const result = await executeSqlFile('mariadb', './test/db/mariadb_and_mysql_file.sql', false, true) // execute SQL file; also test verbose logging
@@ -110,7 +83,7 @@ describe('CLI', function () {
     assert.equal(result, 'executed') // check if result equals 'executed'
   })
 
-  it('should run --dump-schema CLI script and dump schema of connected MariaDB database to defined path', async function () {
+  itIfDump('mariadb')('should run --dump-schema CLI script and dump schema of connected MariaDB database to defined path', async function () {
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
     await createDatabase('mariadb') // create database
     const result = await dumpSchema('mariadb', './test/db/schema.sql') // dump schema
@@ -119,7 +92,7 @@ describe('CLI', function () {
     assert.equal(result, 'executed')
   })
 
-  it('should run --dump-data CLI script and dump data connected MariaDB database to defined path', async function () {
+  itIfDump('mariadb')('should run --dump-data CLI script and dump data connected MariaDB database to defined path', async function () {
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
     await createDatabase('mariadb') // create database
     const result = await dumpData('mariadb', './test/db/schema.sql') // dump data
@@ -128,7 +101,7 @@ describe('CLI', function () {
     assert.equal(result, 'executed')
   })
 
-  it('should run MariaDB --dump-schema CLI script and print error due to mysqldump command not being in PATH', async function () {
+  itIfDump('mariadb')('should run MariaDB --dump-schema CLI script and print error due to mysqldump command not being in PATH', async function () {
     const pathEnv = process.env.PATH
 
     // remove mysql from PATH
@@ -150,21 +123,7 @@ describe('CLI', function () {
 
     // run dump schema script
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
-    let result
-    if (isDocker) {
-      const mariadbConfig = JSON.parse(fs.readFileSync(path.normalize('./test/configs/.mariadb-config.json')))
-      mariadbConfig.mariadb.config.port = 3307
-      mariadbConfig.mariadb.adminConfig.port = 3307
-      fs.writeFileSync(path.normalize('./test/configs/.mariadb-config.json'), JSON.stringify(mariadbConfig, null, 2))
-
-      result = await dumpSchema('mariadb', './test/db/schema.sql', true)
-
-      mariadbConfig.mariadb.config.port = 3306
-      mariadbConfig.mariadb.adminConfig.port = 3306
-      fs.writeFileSync(path.normalize('./test/configs/.mariadb-config.json'), JSON.stringify(mariadbConfig, null, 2))
-    } else {
-      result = await dumpSchema('mariadb', './test/db/schema.sql')
-    }
+    const result = await dumpSchema('mariadb', './test/db/schema.sql')
 
     process.env.PATH = pathEnv // reset PATH for rest of tests
     await destroyDatabase('mariadb') // destroy database
@@ -172,61 +131,49 @@ describe('CLI', function () {
     assert.equal(result, 'error') // check if result equals 'error'
   })
 
-  it('should run --create CLI script and create MySQL user, database, and table', async function () {
+  itIf('mysql')('should run --create CLI script and create MySQL user, database, and table', async function () {
     const result = await createDatabase('mysql', false, true) // create database; also test verbose logs
     assert.equal(result, 'created') // check if result equals 'created'
   })
 
-  it('should run --destroy CLI script and destroy MySQL database', async function () {
+  itIf('mysql')('should run --destroy CLI script and destroy MySQL database', async function () {
     await createDatabase('mysql') // create database
     const droppedDatabase = await destroyDatabase('mysql') // destroy database
-    if (isDocker) {
-      const mySqlConfig = JSON.parse(fs.readFileSync(path.normalize('.multi-db-driver-config.json')))
-      mySqlConfig.mysql.config.port = 3307
-      mySqlConfig.mysql.adminConfig.port = 3307
-      fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(mySqlConfig, null, 2))
-    }
     const result = await destroyedDatabaseCheck('mysql', droppedDatabase) // destroy database
-    if (isDocker) {
-      const mySqlConfig = JSON.parse(fs.readFileSync(path.normalize('.multi-db-driver-config.json')))
-      mySqlConfig.mysql.config.port = 3306
-      mySqlConfig.mysql.adminConfig.port = 3306
-      fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(mySqlConfig, null, 2))
-    }
     assert.equal(result, 'destroyed') // check if result equals 'destroyed'
   })
 
-  it('should run --file CLI script against a MySQL database', async function () {
+  itIf('mysql')('should run --file CLI script against a MySQL database', async function () {
     await createDatabase('mysql') // create database
     const result = await executeSqlFile('mysql', './test/db/mariadb_and_mysql_file.sql', false, true) // execute SQL file; also test verbose logging
     assert.equal(result, 'executed') // check if result equals 'executed'
   })
 
-  it('should run --dump-schema CLI script and dump schema of connected MySQL database to defined path', async function () {
+  itIfDump('mysql')('should run --dump-schema CLI script and dump schema of connected MySQL database to defined path', async function () {
     await createDatabase('mysql') // create database
     const result = await dumpSchema('mysql', './test/db/schema.sql')
     assert.equal(result, 'executed')
   })
 
-  it('should run --dump-data CLI script and dump data connected MySQL database to defined path', async function () {
+  itIfDump('mysql')('should run --dump-data CLI script and dump data connected MySQL database to defined path', async function () {
     await createDatabase('mysql') // create database
     const result = await dumpData('mysql', './test/db/schema.sql')
     assert.equal(result, 'executed')
   })
 
-  it('should run MySQL --dump-schema CLI script and print error due to invalid path', async function () {
+  itIfDump('mysql')('should run MySQL --dump-schema CLI script and print error due to invalid path', async function () {
     await createDatabase('mysql') // create database
     const result = await dumpSchema('mysql', './test/invalid/schema.sql')
     assert.equal(result, 'error')
   })
 
-  it('should run MySQL --dump-data CLI script and print error due to invalid path', async function () {
+  itIfDump('mysql')('should run MySQL --dump-data CLI script and print error due to invalid path', async function () {
     await createDatabase('mysql') // create database
     const result = await dumpData('mysql', './test/invalid/schema.sql')
     assert.equal(result, 'error')
   })
 
-  it('should run MySQL --dump-schema CLI script and print error due to mysqldump command not being in PATH', async function () {
+  itIfDump('mysql')('should run MySQL --dump-schema CLI script and print error due to mysqldump command not being in PATH', async function () {
     const pathEnv = process.env.PATH
 
     // remove mysql from PATH
@@ -247,21 +194,7 @@ describe('CLI', function () {
     process.env.PATH = joinPathNoMysql
 
     // run dump schema script
-    let result
-    if (isDocker) {
-      const mysqlConfig = JSON.parse(fs.readFileSync(path.normalize('.multi-db-driver-config.json')))
-      mysqlConfig.mysql.config.port = 3307
-      mysqlConfig.mysql.adminConfig.port = 3307
-      fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(mysqlConfig, null, 2))
-
-      result = await dumpSchema('mysql', './test/db/schema.sql', true)
-
-      mysqlConfig.mysql.config.port = 3306
-      mysqlConfig.mysql.adminConfig.port = 3306
-      fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(mysqlConfig, null, 2))
-    } else {
-      result = await dumpSchema('mysql', './test/db/schema.sql')
-    }
+    const result = await dumpSchema('mysql', './test/db/schema.sql')
 
     process.env.PATH = pathEnv // reset PATH for rest of tests
     assert.equal(result, 'error') // check if result equals 'error'
@@ -287,61 +220,49 @@ describe('CLI', function () {
     assert.equal(result, 'executed') // check if result equals 'executed'
   })
 
-  it('should run --create CLI script and create PostgreSQL user, database, and table', async function () {
+  itIf('postgres')('should run --create CLI script and create PostgreSQL user, database, and table', async function () {
     const result = await createDatabase('postgres', true) // create database
     assert.equal(result, 'created') // check if result equals 'created'
   })
 
-  it('should run --destroy CLI script and destroy PostgreSQL database', async function () {
+  itIf('postgres')('should run --destroy CLI script and destroy PostgreSQL database', async function () {
     await createDatabase('postgres') // create database
     const droppedDatabase = await destroyDatabase('postgres') // destroy database
-    if (isDocker) {
-      const postgresConfig = JSON.parse(fs.readFileSync(path.normalize('.multi-db-driver-config.json')))
-      postgresConfig.postgres.config.port = 5442
-      postgresConfig.postgres.adminConfig.port = 5442
-      fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(postgresConfig, null, 2))
-    }
     const result = await destroyedDatabaseCheck('postgres', droppedDatabase)
-    if (isDocker) {
-      const postgresConfig = JSON.parse(fs.readFileSync(path.normalize('.multi-db-driver-config.json')))
-      postgresConfig.postgres.config.port = 5432
-      postgresConfig.postgres.adminConfig.port = 5432
-      fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(postgresConfig, null, 2))
-    }
     assert.equal(result, 'destroyed') // check if result equals 'destroyed'
   })
 
-  it('should run --file CLI script against a PostgreSQL database', async function () {
+  itIf('postgres')('should run --file CLI script against a PostgreSQL database', async function () {
     await createDatabase('postgres') // create database
     const result = await executeSqlFile('postgres', './test/db/pglite_postgres_and_sqlite_file.sql') // execute SQL file
     assert.equal(result, 'executed') // check if result equals 'executed'
   })
 
-  it('should run --dump-schema CLI script and dump schema of connected PostgreSQL database to defined path', async function () {
+  itIfDump('postgres')('should run --dump-schema CLI script and dump schema of connected PostgreSQL database to defined path', async function () {
     await createDatabase('postgres') // create database
     const result = await dumpSchema('postgres', './test/db/schema.sql')
     assert.equal(result, 'executed')
   })
 
-  it('should run --dump-data CLI script and dump data of connected PostgreSQL database to defined path', async function () {
+  itIfDump('postgres')('should run --dump-data CLI script and dump data of connected PostgreSQL database to defined path', async function () {
     await createDatabase('postgres') // create database
     const result = await dumpData('postgres', './test/db/schema.sql')
     assert.equal(result, 'executed')
   })
 
-  it('should run PostgreSQL --dump-schema CLI script and print error due to invalid path', async function () {
+  itIfDump('postgres')('should run PostgreSQL --dump-schema CLI script and print error due to invalid path', async function () {
     await createDatabase('postgres') // create database
     const result = await dumpSchema('postgres', './test/invalid/schema.sql')
     assert.equal(result, 'error')
   })
 
-  it('should run PostgreSQL --dump-data CLI script and print error due to invalid path', async function () {
+  itIfDump('postgres')('should run PostgreSQL --dump-data CLI script and print error due to invalid path', async function () {
     await createDatabase('postgres') // create database
     const result = await dumpData('postgres', './test/invalid/schema.sql')
     assert.equal(result, 'error')
   })
 
-  it('should run PostgreSQL --dump-schema CLI script and print error due to pg_dump command not being in PATH', async function () {
+  itIfDump('postgres')('should run PostgreSQL --dump-schema CLI script and print error due to pg_dump command not being in PATH', async function () {
     const pathEnv = process.env.PATH
 
     // remove psql from PATH
@@ -361,21 +282,7 @@ describe('CLI', function () {
     const joinPathNoPsql = os.platform() === 'win32' ? splitPath.join(';') : splitPath.join(':')
     process.env.PATH = joinPathNoPsql
 
-    let result
-    if (isDocker) {
-      const postgresConfig = JSON.parse(fs.readFileSync(path.normalize('.multi-db-driver-config.json')))
-      postgresConfig.postgres.config.port = 5442
-      postgresConfig.postgres.adminConfig.port = 5442
-      fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(postgresConfig, null, 2))
-
-      result = await dumpSchema('postgres', './test/db/schema.sql', true)
-
-      postgresConfig.postgres.config.port = 5432
-      postgresConfig.postgres.adminConfig.port = 5432
-      fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(postgresConfig, null, 2))
-    } else {
-      result = await dumpSchema('postgres', './test/db/schema.sql')
-    }
+    const result = await dumpSchema('postgres', './test/db/schema.sql')
 
     process.env.PATH = pathEnv // reset PATH for rest of tests
     assert.equal(result, 'error')
@@ -399,19 +306,19 @@ describe('CLI', function () {
     assert.equal(result, 'executed') // check if result equals 'executed'
   })
 
-  it('should run --dump-schema CLI script and dump schema of connected SQLite database to defined path', async function () {
+  itIfDump('sqlite')('should run --dump-schema CLI script and dump schema of connected SQLite database to defined path', async function () {
     await createDatabase('sqlite') // create database
     const result = await dumpSchema('sqlite', './test/db/schema.sql')
     assert.equal(result, 'executed')
   })
 
-  it('should run --dump-data CLI script and dump data connected SQLite database to defined path', async function () {
+  itIfDump('sqlite')('should run --dump-data CLI script and dump data connected SQLite database to defined path', async function () {
     await createDatabase('sqlite') // create database
     const result = await dumpData('sqlite', './test/db/schema.sql')
     assert.equal(result, 'executed')
   })
 
-  it('should run SQLite --dump-schema CLI script and print error due to pg_dump command not being in PATH', async function () {
+  itIfDump('sqlite')('should run SQLite --dump-schema CLI script and print error due to pg_dump command not being in PATH', async function () {
     const pathEnv = process.env.PATH
 
     // remove sqlite3 from PATH
@@ -431,19 +338,19 @@ describe('CLI', function () {
     const joinPathNoSqlite = os.platform() === 'win32' ? splitPath.join(';') : splitPath.join(':')
     process.env.PATH = joinPathNoSqlite
 
-    const result = isDocker ? await dumpSchema('sqlite', './test/db/schema.sql', true) : await dumpSchema('sqlite', './test/db/schema.sql')
+    const result = await dumpSchema('sqlite', './test/db/schema.sql')
     process.env.PATH = pathEnv // reset PATH for rest of tests
     assert.equal(result, 'error')
   })
 
-  it('should run --create CLI script and print error due to undefined schema', async function () {
+  itIf('postgres')('should run --create CLI script and print error due to undefined schema', async function () {
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.multi-db-driver-config-no-schema.json' // env var for config location
     const result = await createDatabase('sqlite') // create database
     delete process.env.MULTI_DB_DRIVER_CONFIG_LOCATION // delete env var
     assert.equal(result, 'error') // check if result equals 'executed'
   })
 
-  it('should run --create CLI script and print error due to invalid schema syntax', async function () {
+  itIf('postgres')('should run --create CLI script and print error due to invalid schema syntax', async function () {
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.multi-db-driver-config-invalid-schema.json' // env var for config location
     const result = await createDatabase('sqlite') // create database
     delete process.env.MULTI_DB_DRIVER_CONFIG_LOCATION // delete env var
@@ -667,6 +574,36 @@ describe('multi-db-driver', function () {
     assert.deepEqual(rows, values) // check if rows from test_table equal inserted values
   })
 
+  // the engine keyed form of the query object used to be covered only as a side effect of the postgres suite, which meant it went untested wherever postgres was unavailable
+  it('should check an engine-specific member of the query object', async function () {
+    await createDatabase('sqlite') // create database
+
+    // connect to database with loggerConfig
+    const db = await require('../multi-db-driver')({
+      loggerConfig: {
+        log: false,
+        error: false,
+        verbose: false
+      }
+    })
+
+    // insert values into table
+    for (let i = 0; i < values.length; i++) {
+      await db.query(`insert into test_table (
+        name,
+        description
+      ) values (?, ?)`, [values[i].name, values[i].description])
+    }
+
+    // run a query keyed to the engine in use rather than to "default"
+    const { rows } = await db.query({
+      sqlite: 'select * from test_table'
+    })
+
+    await db.endConnection() // end connection
+    assert.deepEqual(rows, values) // check if rows from test_table equal inserted values
+  })
+
   it('should run argument 2 in the query as a post-process function', async function () {
     await createDatabase('sqlite') // create database
 
@@ -702,20 +639,14 @@ describe('multi-db-driver', function () {
     assert.deepEqual(result, values) // check if error was printed due to falsey query
   })
 
-  it('should test database connection using testConnection method', async function () {
+  itIf('postgres')('should test database connection using testConnection method', async function () {
     await createDatabase('postgres', 'localhost', 5432) // create database
 
     // connect to database
     const db = await require('../multi-db-driver')({
       default: 'postgres',
       postgres: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres_multi_db_tests_user',
-          password: 'postgres_multi_db_tests_password',
-          database: 'postgres_multi_db_tests_database'
-        }
+        config: fixture.configs.postgres.config
       },
       loggerConfig: {
         log: false,
@@ -729,28 +660,15 @@ describe('multi-db-driver', function () {
     assert.equal(!!result, true) // check if connection was successfully tested
   })
 
-  it('should print error due to failed connection test', async function () {
+  itIf('postgres')('should print error due to failed connection test', async function () {
     await createDatabase('postgres', 'localhost', 5432) // create database
     for (const key in multiDb.defaultCredentials.postgres) multiDb.defaultCredentials.postgres[key].host = 'foo' // change host value in for each credential
     // connect to database
     const db = await multiDb({
       default: 'postgres',
       postgres: {
-        config: {
-          host: 'foo',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres_multi_db_tests_user',
-          password: 'postgres_multi_db_tests_password',
-          database: 'postgres_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'bar',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres',
-          password: 'postgres',
-          database: 'postgres'
-        },
-        schema: 'test/db/pglite_postgres_and_sqlite_schema.sql'
+        config: { ...fixture.configs.postgres.config, host: 'foo' },
+        adminConfig: { ...fixture.configs.postgres.adminConfig, host: 'bar' }
       },
       loggerConfig: {
         log: false,
@@ -768,499 +686,206 @@ describe('multi-db-driver', function () {
 })
 
 // MariaDB tests
-describe('MariaDB', function () {
-  afterEach(async function () {
-    await destroyDatabase('mariadb')
-    delete process.env.MULTI_DB_DRIVER_CONFIG_LOCATION // delete env var
-  })
-
-  it('should insert values into table', async function () {
-    if (!isDocker) process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
-    await createDatabase('mariadb') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'mariadb',
-      mariadb: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'mariadb_multi_db_tests_user',
-          password: 'mariadb_multi_db_tests_password',
-          database: 'mariadb_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
+// the engines whose tests run against a connection this file opens directly. their tests were four near-identical copies, so they are generated from one place instead: anything genuinely per-engine lives in the spec below, and anything unique to one engine lives in its extraTests. pglite is not in here because its tests run in child processes, which makes them a different shape
+const sqlEngines = [
+  {
+    label: 'MariaDB',
+    engine: 'mariadb',
+    handle: db => db.mariadb.conn,
+    configLocation: './test/configs/.mariadb-config.json', // mariadb has no section in the root config
+    badConfig: () => ({
+      config: { ...fixture.configs.mariadb.config, host: 'foo' },
+      adminConfig: { ...fixture.configs.mariadb.adminConfig, host: 'foo' }
+    }),
+    // without short timeouts the mariadb driver spends about half a minute giving up on the bad host
+    badCredentialExtras: { acquireTimeout: 100, initializationTimeout: 1000 }
+  },
+  {
+    label: 'MySQL',
+    engine: 'mysql',
+    handle: db => db.mysql.conn,
+    badConfig: () => ({
+      config: { ...fixture.configs.mysql.config, host: 'foo' },
+      adminConfig: { ...fixture.configs.mysql.adminConfig, host: 'foo' }
     })
+  },
+  {
+    label: 'PostgreSQL',
+    engine: 'postgres',
+    handle: db => db.postgres.client,
+    badConfig: () => ({
+      config: { ...fixture.configs.postgres.config, host: 'foo' },
+      adminConfig: { ...fixture.configs.postgres.adminConfig, host: 'bar' }
+    }),
+    extraTests (spec) {
+      // postgres natively wants $1 rather than ?, so the driver rewrites placeholders unless this is turned off. that opt-out is only exercised here
+      it('should accept native $1 placeholders when questionMarkParamsForPostgres is off', async function () {
+        await createDatabase(spec.engine) // create database
+        const db = await connectTo(spec, { questionMarkParamsForPostgres: false })
 
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values (?, ?)`, [values[i].name, values[i].description])
+        // insert values into table using postgres placeholder syntax
+        for (let i = 0; i < values.length; i++) {
+          await db.query(`insert into test_table (
+            name,
+            description
+          ) values ($1, $2)`, [values[i].name, values[i].description])
+        }
+
+        const result = await db.query('select * from test_table') // select all values from table
+        await db.endConnection() // end connection
+        assert.deepEqual(result.rows, values) // check if rows match inserted values
+      })
     }
+  },
+  {
+    label: 'SQLite',
+    engine: 'sqlite',
+    handle: db => db.sqlite.db,
+    rollback: false, // sqlite has never had a rollback test
+    transaction: { placeholders: '(@name, @description)', perRow: true },
+    // sqlite has no host to point at a dead server, so a path that cannot be opened is what makes its config bad
+    badConfig: () => ({ config: { database: './test/sqlite-db/path-doesnt-exist/sqlite_multi_db_automated_tests.sqlite' } }),
+    extraTests (spec) {
+      it('should catch error due to invalid driver', async function () {
+        await createDatabase(spec.engine) // create database
+        multiDb.drivers.sqlite = 'invalid driver'
+        const db = await connectTo(spec)
+        multiDb.drivers.sqlite = 'better-sqlite3'
+        const result = spec.handle(db)
+        await db.endConnection() // end connection
+        assert.equal(!!result, false) // check if result is falsey
+      })
+    }
+  }
+]
 
-    const results = await db.query('select * from test_table') // select all values from table
-    const resultsArray = []
-    for (let i = 0; i < values.length; i++) resultsArray.push(results.rows[i])
-    await db.endConnection() // end connection
-    assert.deepEqual(resultsArray, values) // check if results match inserted values
+const silentLogger = { log: false, error: false, verbose: false } // tests assert on returned values, not on log output
+
+// open a connection for one engine, optionally overriding the driver config or passing extra top level options
+async function connectTo (spec, options = {}) {
+  const { driverConfig, ...rest } = options
+  return multiDb({
+    default: spec.engine,
+    [spec.engine]: driverConfig || fixture.configs[spec.engine],
+    loggerConfig: silentLogger,
+    ...rest
   })
+}
 
-  it('should insert array of objects into table using a transaction', async function () {
-    if (!isDocker) process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
-    await createDatabase('mariadb') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'mariadb',
-      mariadb: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'mariadb_multi_db_tests_user',
-          password: 'mariadb_multi_db_tests_password',
-          database: 'mariadb_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
+// insert the test values one row at a time
+async function insertEachValue (db, placeholders = '(?, ?)') {
+  for (let i = 0; i < values.length; i++) {
     await db.query(`insert into test_table (
       name,
       description
-    ) values (?, ?)`, values)
+    ) values ${placeholders}`, [values[i].name, values[i].description])
+  }
+}
 
-    const results = await db.query('select * from test_table') // select all values from table
-    const resultsArray = []
-    for (let i = 0; i < values.length; i++) resultsArray.push(results.rows[i])
-    await db.endConnection() // end connection
-    assert.deepEqual(resultsArray, values) // check if results match inserted values
-  })
-
-  it('should delete all values from table', async function () {
-    if (!isDocker) process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
-    await createDatabase('mariadb') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'mariadb',
-      mariadb: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'mariadb_multi_db_tests_user',
-          password: 'mariadb_multi_db_tests_password',
-          database: 'mariadb_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
+for (const spec of sqlEngines) {
+  describeIf(spec.engine)(spec.label, function () {
+    beforeEach(function () {
+      if (spec.configLocation) process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = spec.configLocation // env var for config location
     })
 
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values (?, ?)`, [values[i].name, values[i].description])
+    afterEach(async function () {
+      await destroyDatabase(spec.engine)
+      delete process.env.MULTI_DB_DRIVER_CONFIG_LOCATION // delete env var
+    })
+
+    it('should insert values into table', async function () {
+      await createDatabase(spec.engine) // create database
+      const db = await connectTo(spec)
+      await insertEachValue(db) // insert values into table
+      const result = await db.query('select * from test_table') // select all values from table
+      await db.endConnection() // end connection
+      assert.deepEqual(result.rows, values) // check if rows match inserted values
+    })
+
+    it('should insert array of objects into table using a transaction', async function () {
+      await createDatabase(spec.engine) // create database
+      const db = await connectTo(spec)
+      const transaction = spec.transaction || {}
+      const placeholders = transaction.placeholders || '(?, ?)'
+
+      // insert values into table. most drivers take the whole array in one call; sqlite binds named params a row at a time
+      if (transaction.perRow) {
+        for (let i = 0; i < values.length; i++) {
+          await db.query(`insert into test_table (
+            name,
+            description
+          ) values ${placeholders}`, values)
+        }
+      } else {
+        await db.query(`insert into test_table (
+          name,
+          description
+        ) values ${placeholders}`, values)
+      }
+
+      const result = await db.query('select * from test_table') // select all values from table
+      await db.endConnection() // end connection
+      assert.deepEqual(result.rows, values) // check if rows match inserted values
+    })
+
+    it('should delete all values from table', async function () {
+      await createDatabase(spec.engine) // create database
+      const db = await connectTo(spec)
+      await insertEachValue(db) // insert values into table
+      await db.query('delete from test_table') // delete values from table
+      const result = await db.query('select * from test_table') // select all values from table
+      await db.endConnection() // end connection
+      assert.equal(result.rows.length, 0) // check if table has 0 rows
+    })
+
+    if (spec.rollback !== false) {
+      it('should roll back transaction due to error', async function () {
+        await createDatabase(spec.engine) // create database
+        const db = await connectTo(spec)
+        const dbBeforeState = await db.query('select * from test_table') // select all values from table
+
+        // insert values into table with a typo, so the transaction has to roll back
+        await db.query(`inser into test_table (
+          name,
+          description
+        ) values (?, ?)`, values)
+
+        const dbAfterState = await db.query('select * from test_table') // select all values from table
+        await db.endConnection() // end connection
+        assert.deepEqual(dbAfterState.rows, dbBeforeState.rows) // check if the table was left as it was found
+      })
     }
 
-    await db.query('delete from test_table') // delete values from table
-    const results = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.equal(results.rows.length, 0) // check if table has 0 rows
-  })
+    it('should print errors due to invalid SQL syntax', async function () {
+      await createDatabase(spec.engine) // create database
 
-  it('should roll back transaction due to error', async function () {
-    if (!isDocker) process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
-    await createDatabase('mariadb') // create database
+      // run query with invalid syntax
+      const result = await runQueryWithInvalidSyntax({
+        default: spec.engine,
+        [spec.engine]: fixture.configs[spec.engine],
+        loggerConfig: silentLogger
+      })
 
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'mariadb',
-      mariadb: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'mariadb_multi_db_tests_user',
-          password: 'mariadb_multi_db_tests_password',
-          database: 'mariadb_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
+      assert.ok(result.error) // an invalid query resolves to the error rather than rows
     })
 
-    const dbBeforeState = await db.query('select * from test_table') // select all values from table
+    it('should print errors due to bad config', async function () {
+      await createDatabase(spec.engine) // create database
+      const defaults = multiDb.defaultCredentials[spec.engine]
 
-    // insert values into table
-    await db.query(`inser into test_table (
-      name,
-      description
-    ) values (?, ?)`, values)
+      // point the fallback credentials somewhere dead too, so the driver cannot quietly rescue the bad config by guessing
+      for (const key in defaults) Object.assign(defaults[key], { host: 'foo' }, spec.badCredentialExtras)
 
-    const dbAfterState = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.deepEqual(dbAfterState.rows, dbBeforeState.rows) // check if results match inserted values
-  })
-
-  it('should print errors due to invalid SQL syntax', async function () {
-    if (!isDocker) process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.mariadb-config.json' // env var for config location
-    await createDatabase('mariadb') // create database
-
-    // run query with invalid syntax
-    const result = await runQueryWithInvalidSyntax({
-      default: 'mariadb',
-      mariadb: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'mariadb_multi_db_tests_user',
-          password: 'mariadb_multi_db_tests_password',
-          database: 'mariadb_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3317 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
+      const db = await connectTo(spec, { driverConfig: spec.badConfig() })
+      for (const key in defaults) defaults[key].host = 'localhost' // change host values back
+      const result = spec.handle(db)
+      await db.endConnection() // end connection
+      assert.equal(!!result, false) // check if result is falsey
     })
 
-    assert.equal(!!result, false) // check if result is falsey
+    if (spec.extraTests) spec.extraTests(spec)
   })
-
-  it('should print errors due to bad config', async function () {
-    await createDatabase('mariadb') // create database
-
-    // change host value in for each credential
-    for (const key in multiDb.defaultCredentials.mariadb) {
-      multiDb.defaultCredentials.mariadb[key].host = 'foo'
-      multiDb.defaultCredentials.mariadb[key].acquireTimeout = 100
-      multiDb.defaultCredentials.mariadb[key].initializationTimeout = 1000
-    }
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'mariadb',
-      mariadb: {
-        config: {
-          host: 'foo',
-          port: isDocker ? 3317 : 3306,
-          user: 'mariadb_multi_db_tests_user',
-          password: 'mariadb_multi_db_tests_password',
-          database: 'mariadb_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'foo',
-          port: isDocker ? 3317 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    for (const key in multiDb.defaultCredentials.mariadb) multiDb.defaultCredentials.mariadb[key].host = 'localhost' // change host values back
-    const result = db.mariadb.conn
-    await db.endConnection() // end connection
-    assert.equal(!!result, false) // check if result is falsey
-  })
-})
-
-// MySQL tests
-describe('MySQL', function () {
-  afterEach(async function () {
-    await destroyDatabase('mysql')
-  })
-
-  it('should insert values into table', async function () {
-    await createDatabase('mysql') // create database
-
-    // connect to database
-    const db = await multiDb({
-      default: 'mysql',
-      mysql: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'mysql_multi_db_tests_user',
-          password: 'mysql_multi_db_tests_password',
-          database: 'mysql_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values (?, ?)`, [values[i].name, values[i].description])
-    }
-
-    const result = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.deepEqual(result.rows, values) // check if results match inserted values
-  })
-
-  it('should insert array of objects into table using a transaction', async function () {
-    await createDatabase('mysql') // create database
-
-    // connect to database
-    const db = await multiDb({
-      default: 'mysql',
-      mysql: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'mysql_multi_db_tests_user',
-          password: 'mysql_multi_db_tests_password',
-          database: 'mysql_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
-    await db.query(`insert into test_table (
-      name,
-      description
-    ) values (?, ?)`, values)
-
-    const result = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.deepEqual(result.rows, values) // check if results match inserted values
-  })
-
-  it('should delete all values from table', async function () {
-    await createDatabase('mysql') // create database
-
-    // connect to database
-    const db = await multiDb({
-      default: 'mysql',
-      mysql: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'mysql_multi_db_tests_user',
-          password: 'mysql_multi_db_tests_password',
-          database: 'mysql_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values (?, ?)`, [values[i].name, values[i].description])
-    }
-
-    await db.query('delete from test_table') // delete values from table
-    const result = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.equal(result.rows, 0) // check if table has 0 rows
-  })
-
-  it('should roll back transaction due to error', async function () {
-    await createDatabase('mysql') // create database
-
-    // connect to database
-    const db = await multiDb({
-      default: 'mysql',
-      mysql: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'mysql_multi_db_tests_user',
-          password: 'mysql_multi_db_tests_password',
-          database: 'mysql_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    const dbBeforeState = await db.query('select * from test_table') // select all values from table
-
-    // insert values into table
-    await db.query(`inser into test_table (
-      name,
-      description
-    ) values (?, ?)`, values)
-
-    const dbAfterState = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.deepEqual(dbAfterState.rows, dbBeforeState.rows) // check if results match inserted values
-  })
-
-  it('should print errors due to invalid SQL syntax', async function () {
-    await createDatabase('mysql') // create database
-
-    // run query with invalid syntax
-    const result = await runQueryWithInvalidSyntax({
-      default: 'mysql',
-      mysql: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'mysql_multi_db_tests_user',
-          password: 'mysql_multi_db_tests_password',
-          database: 'mysql_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 3307 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      }
-    })
-
-    assert.equal(!!result, false) // check if result is false
-  })
-
-  it('should print errors due to bad config', async function () {
-    await createDatabase('mysql') // create database
-    for (const key in multiDb.defaultCredentials.mysql) multiDb.defaultCredentials.mysql[key].host = 'foo' // change host value in for each credential
-
-    // connect to database
-    const db = await multiDb({
-      default: 'mysql',
-      mysql: {
-        config: {
-          host: 'foo',
-          port: isDocker ? 3307 : 3306,
-          user: 'mysql_multi_db_tests_user',
-          password: 'mysql_multi_db_tests_password',
-          database: 'mysql_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'foo',
-          port: isDocker ? 3307 : 3306,
-          user: 'root',
-          password: 'password',
-          database: 'mysql'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    for (const key in multiDb.defaultCredentials.mysql) multiDb.defaultCredentials.mysql[key].host = 'localhost' // change host values back
-    const result = db.mysql.conn
-    await db.endConnection() // end connection
-    assert.equal(!!result, false) // check if result is falsey
-  })
-})
+}
 
 // PGlite tests
 describe('PGlite', function () {
@@ -1295,435 +920,13 @@ describe('PGlite', function () {
 
   it('should print errors due to invalid SQL syntax', async function () {
     const printInvalidSqlErrors = spawnSync('node', ['./test/util/printPgliteErrorsDueToInvalidSql.js'], { shell: false })
-    const result = printInvalidSqlErrors.stdout.toString()
-    assert.equal(result.trimEnd(), 'undefined') // check if result equals undefined
+    const result = JSON.parse(printInvalidSqlErrors.stdout.toString())
+    assert.ok(result.error) // an invalid query resolves to the error rather than rows
   })
 
   it('should print errors due to bad config', async function () {
     const printBadConfigErrors = spawnSync('node', ['./test/util/printPgliteErrorsDueToBadConfig.js'], { shell: false })
     const result = printBadConfigErrors.stdout.toString()
     assert.equal(result.trimEnd(), 'undefined') // check if result equals undefined
-  })
-})
-
-// PostgreSQL tests
-describe('PostgreSQL', function () {
-  afterEach(async function () {
-    await destroyDatabase('postgres')
-  })
-
-  it('should insert values into table', async function () {
-    await createDatabase('postgres') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'postgres',
-      postgres: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres_multi_db_tests_user',
-          password: 'postgres_multi_db_tests_password',
-          database: 'postgres_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres',
-          password: 'postgres',
-          database: 'postgres'
-        },
-        schema: 'test/db/pglite_postgres_and_sqlite_schema.sql'
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values (?, ?)`, [values[i].name, values[i].description])
-    }
-
-    // select all values from table
-    const { rows } = await db.query({
-      postgres: 'select * from test_table'
-    })
-
-    await db.endConnection() // end connection
-    assert.deepEqual(rows, values) // check if rows match inserted values
-  })
-
-  it('should insert array of objects into table using a transaction', async function () {
-    await createDatabase('postgres') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'postgres',
-      postgres: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres_multi_db_tests_user',
-          password: 'postgres_multi_db_tests_password',
-          database: 'postgres_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres',
-          password: 'postgres',
-          database: 'postgres'
-        },
-        schema: 'test/db/pglite_postgres_and_sqlite_schema.sql'
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
-    await db.query(`insert into test_table (
-      name,
-      description
-    ) values (?, ?)`, values)
-
-    // select all values from table
-    const { rows } = await db.query({
-      postgres: 'select * from test_table'
-    })
-
-    await db.endConnection() // end connection
-    assert.deepEqual(rows, values) // check if rows match inserted values
-  })
-
-  it('should delete all values from table', async function () {
-    await createDatabase('postgres') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'postgres',
-      postgres: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres_multi_db_tests_user',
-          password: 'postgres_multi_db_tests_password',
-          database: 'postgres_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres',
-          password: 'postgres',
-          database: 'postgres'
-        },
-        schema: 'test/db/pglite_postgres_and_sqlite_schema.sql'
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      },
-      questionMarkParamsForPostgres: false
-    })
-
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values ($1, $2)`, [values[i].name, values[i].description])
-    }
-
-    await db.query('delete from test_table') // delete values from table
-    const { rows } = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.equal(rows.length, 0) // check if table has 0 rows
-  })
-
-  it('should roll back transaction due to error', async function () {
-    await createDatabase('postgres') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'postgres',
-      postgres: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres_multi_db_tests_user',
-          password: 'postgres_multi_db_tests_password',
-          database: 'postgres_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres',
-          password: 'postgres',
-          database: 'postgres'
-        },
-        schema: 'test/db/pglite_postgres_and_sqlite_schema.sql'
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    const dbBeforeState = await db.query('select * from test_table') // select all values from table
-
-    // insert values into table
-    await db.query(`inser into test_table (
-      name,
-      description
-    ) values (?, ?)`, values)
-
-    const dbAfterState = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.deepEqual(dbAfterState.rows, dbBeforeState.rows) // check if results match inserted values
-  })
-
-  it('should print errors due to invalid SQL syntax', async function () {
-    await createDatabase('postgres') // create database
-
-    // run query with invalid syntax
-    const result = await runQueryWithInvalidSyntax({
-      default: 'postgres',
-      postgres: {
-        config: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres_multi_db_tests_user',
-          password: 'postgres_multi_db_tests_password',
-          database: 'postgres_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'localhost',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres',
-          password: 'postgres',
-          database: 'postgres'
-        },
-        schema: 'test/db/pglite_postgres_and_sqlite_schema.sql'
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    assert.equal(!!result, false) // check if result is false
-  })
-
-  it('should print errors due to bad config', async function () {
-    await createDatabase('postgres') // create database
-    for (const key in multiDb.defaultCredentials.postgres) multiDb.defaultCredentials.postgres[key].host = 'foo' // change host value in for each credential
-
-    // connect to database
-    const db = await multiDb({
-      default: 'postgres',
-      postgres: {
-        config: {
-          host: 'foo',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres_multi_db_tests_user',
-          password: 'postgres_multi_db_tests_password',
-          database: 'postgres_multi_db_tests_database'
-        },
-        adminConfig: {
-          host: 'bar',
-          port: isDocker ? 5442 : 5432,
-          user: 'postgres',
-          password: 'postgres',
-          database: 'postgres'
-        },
-        schema: 'test/db/pglite_postgres_and_sqlite_schema.sql'
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    for (const key in multiDb.defaultCredentials.postgres) multiDb.defaultCredentials.postgres[key].host = 'localhost' // change host values back
-    const result = db.postgres.client
-    await db.endConnection() // end connection
-    assert.equal(!!result, false) // check if result is falsey
-  })
-})
-
-// SQLite tests
-describe('SQLite', function () {
-  afterEach(async function () {
-    await destroyDatabase('sqlite')
-  })
-
-  it('should insert values into table', async function () {
-    await createDatabase('sqlite') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'sqlite',
-      sqlite: {
-        config: {
-          database: './test/sqlite-db/sqlite_multi_db_tests_database.sqlite'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values (?, ?)`, [values[i].name, values[i].description])
-    }
-
-    const result = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.deepEqual(result.rows, values) // check if rows match inserted values
-  })
-
-  it('should insert array of objects into table using a transaction', async function () {
-    await createDatabase('sqlite') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'sqlite',
-      sqlite: {
-        config: {
-          database: './test/sqlite-db/sqlite_multi_db_tests_database.sqlite'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values (@name, @description)`, values)
-    }
-
-    const result = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.deepEqual(result.rows, values) // check if rows match inserted values
-  })
-
-  it('should delete all values from table', async function () {
-    await createDatabase('sqlite') // create database
-
-    // connect to database
-    const db = await require('../multi-db-driver')({
-      default: 'sqlite',
-      sqlite: {
-        config: {
-          database: './test/sqlite-db/sqlite_multi_db_tests_database.sqlite'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    // insert values into table
-    for (let i = 0; i < values.length; i++) {
-      await db.query(`insert into test_table (
-        name,
-        description
-      ) values (?, ?)`, [values[i].name, values[i].description])
-    }
-
-    await db.query('delete from test_table') // delete all values from table
-    const result = await db.query('select * from test_table') // select all values from table
-    await db.endConnection() // end connection
-    assert.deepEqual(result.rows.length, 0) // check if table has 0 rows
-  })
-
-  it('should print errors due to invalid SQL syntax', async function () {
-    await createDatabase('sqlite') // create database
-
-    // run invalid sql
-    const result = await runQueryWithInvalidSyntax({
-      default: 'sqlite',
-      sqlite: {
-        config: {
-          database: './test/sqlite-db/sqlite_multi_db_tests_database.sqlite'
-        }
-      }
-    })
-
-    assert.equal(!!result, false) // check if result is falsey
-  })
-
-  it('should print errors due to bad config', async function () {
-    await createDatabase('sqlite') // create database
-
-    // connect to database
-    const db = await multiDb({
-      default: 'sqlite',
-      sqlite: {
-        config: {
-          database: './test/sqlite-db/path-doesnt-exist/sqlite_multi_db_automated_tests.sqlite'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    const result = db.sqlite.db
-    await db.endConnection() // end connection
-    assert.equal(!!result, false) // check if result equals error
-  })
-
-  it('should catch error due to invalid driver', async function () {
-    await createDatabase('sqlite') // create database
-    multiDb.drivers.sqlite = 'invalid driver'
-
-    // connect to database
-    const db = await multiDb({
-      default: 'sqlite',
-      sqlite: {
-        config: {
-          database: './test/sqlite-db/sqlite_multi_db_tests_database.sqlite'
-        }
-      },
-      loggerConfig: {
-        log: false,
-        error: false,
-        verbose: false
-      }
-    })
-
-    multiDb.drivers.sqlite = 'better-sqlite3'
-    const result = db.sqlite.db
-    await db.endConnection() // end connection
-    assert.equal(!!result, false) // check if result is falsey
   })
 })

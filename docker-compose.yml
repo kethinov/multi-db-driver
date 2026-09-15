@@ -1,0 +1,77 @@
+# databases for the test suite
+#
+# `docker compose run --rm test` runs the whole suite against all five supported drivers with nothing installed on the host but docker itself. each database gets its own hostname, so mysql and mariadb both sit on their standard 3306 and no port juggling is needed.
+
+# no service publishes a host port: the test container reaches each database by
+# its service hostname over the compose network, and publishing 5432 or 3306 on
+# the host collides with whatever the developer already has running there. to
+# attach a gui client, add a docker-compose.override.yml of your own with the
+# ports you want.
+
+services:
+  postgres:
+    # keep this in step with the postgresql-client the Dockerfile installs: pg_dump refuses to dump a server newer than itself
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    # data lives in ram: faster, and nothing survives to pollute the next run
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ['CMD-SHELL', 'mysqladmin ping -h 127.0.0.1 -uroot -ppassword --silent']
+      interval: 2s
+      timeout: 5s
+      retries: 45
+
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_ROOT_PASSWORD: password
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ['CMD-SHELL', 'healthcheck.sh --connect --innodb_initialized']
+      interval: 2s
+      timeout: 5s
+      retries: 45
+
+  test:
+    build: .
+    working_dir: /multi-db
+    # run as whoever invoked it, so anything written into the mounted source tree
+    # is owned by them. as root the container leaves behind root-owned files in
+    # coverage/ and elsewhere that the developer then cannot delete or back up.
+    # npm run docker-test fills these in; they default to root if set by hand
+    user: "${MULTI_DB_UID:-0}:${MULTI_DB_GID:-0}"
+    # the healthchecks above are what replace polling the servers by hand
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      mariadb:
+        condition: service_healthy
+    environment:
+      HOME: /tmp # the invoking uid has no home directory inside the image
+      MULTI_DB_TEST_MODE: docker
+      MULTI_DB_TEST_POSTGRES_HOST: postgres
+      MULTI_DB_TEST_MYSQL_HOST: mysql
+      MULTI_DB_TEST_MARIADB_HOST: mariadb
+    volumes:
+      # mount the source so edits are picked up without rebuilding, but keep the container's own node_modules so native builds match the image
+      - .:/multi-db
+      - /multi-db/node_modules
+    command: npm test

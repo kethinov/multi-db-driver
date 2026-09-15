@@ -10,7 +10,7 @@ List of currently-supported database drivers:
 - [pglite](https://www.npmjs.com/package/@electric-sql/pglite) for PGlite.
 - [better-sqlite3](https://www.npmjs.com/package/better-sqlite3) for SQLite.
 
-Then mark the `multi-db-driver` npm package as a dependency in your app as well. Multi-DB Driver is generally designed to work with the latest version of each supported database driver.
+Then mark the `multi-db-driver` npm package as a dependency in your app as well. Multi-DB Driver is generally designed to work with recent versions of each supported database driver. Older versions and newer versions are likely to work too, but we do not test every combination. If you find a version that doesn't work, please open an issue.
 
 Then you can configure Multi-DB Driver and connect to your database.
 
@@ -134,3 +134,94 @@ It is recommended that you create npm scripts in your app's package.json file to
 - `npm run db-data-dump -- path/to/schema.sql`: Executes `node [...]/cli.js --dump-data path/to/schema.sql`.
 
 Replace the `[...]` part in the above examples with the path to where your copy of this module resides, e.g. in `node_modules`, lib, `git_modules`, or wherever it happens to be in your app.
+
+## Writing schemas in a portable way
+
+Here is an example schema that is fully portable across all supported databases:
+
+```sql
+create table if not exists parent_t (
+  id integer primary key,
+  name varchar(64) not null unique,
+  note text,
+  amount double precision,
+  big bigint,
+  started date,
+  created timestamp default current_timestamp,
+  qty integer default 0 check (qty >= 0)
+);
+
+create table if not exists child_t (
+  id integer primary key,
+  parent_id integer,
+  foreign key (parent_id) references parent_t(id)
+);
+
+create index idx_child_parent on child_t (parent_id);
+```
+
+Schema SQL that is portable is roughly:
+
+- `create table if not exists`
+- lowercase, unquoted, non-reserved identifiers
+- `integer`, `bigint`, `varchar(n)`, `text`, `double precision`, `date`, `timestamp`
+- `primary key` on an application-supplied value
+- `not null`, `unique`, `default`, and `check` constraints
+- `foreign key (...) references ...` written as a table-level constraint
+- `default current_timestamp`
+- plain `create index` with no `where` clause
+
+That is enough to express most of a typical schema, but just like in the above examples with writing universal queries, sometimes you will not be able to write a universal schema using fully portable syntax and you will need to rely on specific database features. Features that are specific to databases include auto-increment, `text` columns larger than 64KB on MySQL and MariaDB, JSON, case sensitivity, etc. As such, **you are much more likely to need database-specific schemas than you are to need database-specific queries**.
+
+### Making portable schemas when you need database-specific features
+
+Either:
+
+**Hand-write per-database schema files.** Multi-DB Driver configures `schema` per database, so the parts that cannot be expressed portably can differ per engine while the rest of your application stays the same. This is the simplest answer for the auto-increment problem.
+
+**Or generate them automatically by writing your schema in a neutral format.** If you want a single source of truth, define the schema in a neutral form and emit the dialect-specific schema from it.
+
+Here is an example in [Knex](https://knexjs.org/guide/schema-builder.html):
+
+```javascript
+const fs = require('fs')
+
+const define = k => k.schema.createTable('widgets', t => {
+  t.increments('id')
+  t.string('name', 64).notNullable().unique()
+  t.text('note')
+  t.integer('qty').defaultTo(0)
+  t.timestamp('created').defaultTo(k.fn.now())
+})
+
+for (const [client, file] of [['pg', 'postgres.sql'], ['mysql2', 'mysql.sql'], ['better-sqlite3', 'sqlite.sql']]) {
+  const k = require('knex')({ client, useNullAsDefault: true })
+  fs.writeFileSync(file, define(k).toString() + ';\n') // knex leaves off the final semicolon
+  k.destroy()
+}
+```
+
+That writes three schema files, which between them cover all five databases: use `postgres.sql` for PostgreSQL and PGlite, and `mysql.sql` for both MySQL and MariaDB.
+
+`postgres.sql`:
+
+```sql
+create table "widgets" ("id" serial primary key, "name" varchar(64) not null, "note" text, "qty" integer default '0', "created" timestamptz default CURRENT_TIMESTAMP);
+alter table "widgets" add constraint "widgets_name_unique" unique ("name");
+```
+
+`mysql.sql`:
+
+```sql
+create table `widgets` (`id` int unsigned not null auto_increment primary key, `name` varchar(64) not null, `note` text, `qty` int default '0', `created` timestamp default CURRENT_TIMESTAMP);
+alter table `widgets` add unique `widgets_name_unique`(`name`);
+```
+
+`sqlite.sql`:
+
+```sql
+create table `widgets` (`id` integer not null primary key autoincrement, `name` varchar(64) not null, `note` text, `qty` integer default '0', `created` datetime default CURRENT_TIMESTAMP);
+create unique index `widgets_name_unique` on `widgets` (`name`);
+```
+
+Other tools in the same family include [Prisma](https://www.prisma.io/docs/orm/prisma-schema), [Atlas](https://atlasgo.io/), [Liquibase](https://www.liquibase.com/), and the schema builders in [Sequelize](https://sequelize.org/) and [TypeORM](https://typeorm.io/). You do not have to adopt the whole tool: Knex above is only being used to generate SQL, which you can then hand to Multi-DB Driver as a per-database `schema` file.
