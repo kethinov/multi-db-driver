@@ -115,7 +115,7 @@ function hasBinary (command) {
 
 const embedded = {} // handles for servers this fixture started itself
 
-// in auto mode, look at what is already running here rather than assuming nothing is. the probe runs in a child process because this has to be settled synchronously: mocha registers suites while loading the test files, before any hook can await anything
+// in auto mode, look at what is already running here rather than assuming nothing is. the probe runs in a child process because this has to be settled synchronously: the test runner registers suites while loading the test files, before any hook can await anything
 const serverStatus = {}
 if (mode === 'auto') {
   const requested = {}

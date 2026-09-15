@@ -11,7 +11,8 @@ module.exports = async function runCli (args, options = {}) {
   const child = spawn('node', ['cli.js', ...args, '--yes'], {
     shell: false,
     cwd: path.join(__dirname, '../..'),
-    env: { ...process.env, ...options.env }
+    // colour is disabled because the result is decided by matching this output, and a developer with FORCE_COLOR set would otherwise get ansi escapes mixed into it
+    env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0', ...options.env }
   })
 
   let stdout = ''

@@ -1,6 +1,6 @@
-/* eslint-env mocha */
 process.env.MULTI_DB_DRIVER_CONFIG_FILE_SEARCH_ATTEMPTS = 1 // set config search attempts to 1 by default
-const assert = require('assert')
+const { describe, it, before, after, beforeEach, afterEach } = require('node:test')
+const assert = require('node:assert')
 const fs = require('fs')
 const multiDb = require('../multi-db-driver')
 const os = require('os')
@@ -24,6 +24,9 @@ const itIf = engine => fixture.available(engine) ? it : it.skip
 
 // the dump commands shell out, so their tests need the binary installed as well as the engine reachable. without this they would pass for the wrong reason: a missing binary errors just like a failed dump does
 const itIfDump = engine => fixture.canDump(engine) ? it : it.skip
+
+// child processes inherit whatever colour settings the developer has set, and these tests compare their stdout literally. a value such as undefined goes through util.inspect and comes back wrapped in ansi escapes when colour is on, so colour is disabled for everything spawned from here
+const plainOutput = { shell: false, env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' } }
 
 // values to be used in tests
 const values = [
@@ -894,38 +897,38 @@ describe('PGlite', function () {
   })
 
   it('should insert values into table', async function () {
-    const insertValues = spawnSync('node', ['./test/util/insertValuesIntoPgliteTable.js'], { shell: false })
+    const insertValues = spawnSync('node', ['./test/util/insertValuesIntoPgliteTable.js'], plainOutput)
     const result = insertValues.stdout.toString()
     assert.deepEqual(result.trimEnd(), JSON.stringify(values))
   })
 
   it('should insert array of objects into table using a transaction', async function () {
-    const insertValues = spawnSync('node', ['./test/util/insertValuesIntoPgliteTable.js', '--transaction'], { shell: false })
+    const insertValues = spawnSync('node', ['./test/util/insertValuesIntoPgliteTable.js', '--transaction'], plainOutput)
     const result = insertValues.stdout.toString()
     assert.deepEqual(result.trimEnd(), JSON.stringify(values))
   })
 
   it('should delete all values from table', async function () {
-    const deleteValues = spawnSync('node', ['./test/util/deleteValuesFromPgliteTable.js'], { shell: false })
+    const deleteValues = spawnSync('node', ['./test/util/deleteValuesFromPgliteTable.js'], plainOutput)
     const result = deleteValues.stdout.toString()
     assert.equal(result.trimEnd(), '[]')// check if table has 0 rows
   })
 
   it('should roll back transaction due to error', async function () {
-    const insertValues = spawnSync('node', ['./test/util/insertValuesIntoPgliteTable.js', '--transaction-rollback'], { shell: false })
+    const insertValues = spawnSync('node', ['./test/util/insertValuesIntoPgliteTable.js', '--transaction-rollback'], plainOutput)
     const result = insertValues.stdout.toString()
     const splitResult = result.trimEnd().split(' ')
     assert.deepEqual(splitResult[0], splitResult[1])
   })
 
   it('should print errors due to invalid SQL syntax', async function () {
-    const printInvalidSqlErrors = spawnSync('node', ['./test/util/printPgliteErrorsDueToInvalidSql.js'], { shell: false })
+    const printInvalidSqlErrors = spawnSync('node', ['./test/util/printPgliteErrorsDueToInvalidSql.js'], plainOutput)
     const result = JSON.parse(printInvalidSqlErrors.stdout.toString())
     assert.ok(result.error) // an invalid query resolves to the error rather than rows
   })
 
   it('should print errors due to bad config', async function () {
-    const printBadConfigErrors = spawnSync('node', ['./test/util/printPgliteErrorsDueToBadConfig.js'], { shell: false })
+    const printBadConfigErrors = spawnSync('node', ['./test/util/printPgliteErrorsDueToBadConfig.js'], plainOutput)
     const result = printBadConfigErrors.stdout.toString()
     assert.equal(result.trimEnd(), 'undefined') // check if result equals undefined
   })

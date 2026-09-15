@@ -65,70 +65,76 @@ async function multiDb (params) {
     drivers: multiDb.drivers,
     modifiedQueryCache: {}
   }
-  let credentialsToTry
   let connected
 
-  db.mariadb = {}
-  if (config.mariadb) {
-    credentialsToTry = [
-      config.admin ? config.mariadb.adminConfig : config.mariadb.config, // default to admin config if the admin flag is passed
-      // try some default credentials if the above doesn't work
-      ...multiDb.defaultCredentials.mariadb,
-      // if none of those worked, try either the admin credentials or the user credentials, whichever wasn't used above
-      config.admin ? config.mariadb.config : config.mariadb.adminConfig
-    ]
-  } else {
-    credentialsToTry = []
+  // the shared identity of each engine: how it is named in logs, and where its live handle lives once connected
+  const engines = {
+    mariadb: { engine: 'mariadb', emoji: '🦭', label: 'MariaDB', handle: () => db.mariadb.conn },
+    mysql: { engine: 'mysql', emoji: '🐬', label: 'MySQL', handle: () => db.mysql.conn },
+    pglite: { engine: 'pglite', emoji: '⚡️', label: 'PGlite', handle: () => db.pglite.db },
+    postgres: { engine: 'postgres', emoji: '🐘', label: 'PostgreSQL', handle: () => db.postgres.client },
+    sqlite: { engine: 'sqlite', emoji: '🪶', label: 'SQLite', handle: () => db.sqlite.db }
   }
-  connected = false
-  for (let i = 0; i < credentialsToTry.length; i++) {
-    try {
-      if (isCli) {
-        credentialsToTry[i].multipleStatements = true
-        credentialsToTry[i].allowPublicKeyRetrieval = true
+
+  // an array of objects or an array of arrays as the params means the caller wants each set run as one transaction. selects are excluded because there is nothing to commit
+  function isTransaction (query, params) {
+    return !query.trim().toLowerCase().startsWith('select') && params && typeof params[0] === 'object'
+  }
+
+  // a transaction's params arrive as either objects or arrays, and most drivers want positional values either way
+  function positional (param) {
+    return Array.isArray(param) ? param : Object.values(param)
+  }
+
+  // try the configured credentials, then the common defaults, then whichever of the admin or regular credentials was not tried first. the first set that connects wins and the rest are never attempted
+  async function connectWithLadder (spec, open) {
+    const name = spec.engine
+    const credentialsToTry = config[name]
+      ? [
+          config.admin ? config[name].adminConfig : config[name].config, // default to admin config if the admin flag is passed
+          ...multiDb.defaultCredentials[name], // try some default credentials if the above doesn't work
+          config.admin ? config[name].config : config[name].adminConfig // if none of those worked, try either the admin credentials or the user credentials, whichever wasn't used above
+        ]
+      : []
+    for (const credentials of credentialsToTry) {
+      try {
+        await open(credentials)
+        logger.log(spec.emoji, `${spec.label} database connected with user ${credentials.user} to database ${credentials.database}`)
+        db[name].username = credentials.user
+        db[name].database = credentials.database
+        return true
+      } catch (e) {
+        // do nothing, try the next set of credentials
       }
-      const { createPool } = multiDb.drivers.mariadb
-      db.mariadb.pool = await createPool(credentialsToTry[i])
-      db.mariadb.conn = await db.mariadb.pool.getConnection()
-      logger.log('🦭', ('MariaDB database connected with user ' + credentialsToTry[i].user + ' to database ' + credentialsToTry[i].database).bold)
-      db.mariadb.username = credentialsToTry[i].user
-      db.mariadb.database = credentialsToTry[i].database
-      connected = true
-      break
-    } catch (e) {
-      // do nothing, try the next set of credentials
     }
+    return false
   }
-  if (!connected && config.mariadb) {
-    reportInitFailure('mariadb', '🦭', 'MariaDB')
+
+  // postgres and pglite want $1 style placeholders, so a query written with ? is rewritten for them and the result cached. a query that cannot be parsed is run as written
+  async function rewriteForPostgres (query, skipAST) {
+    if (config.questionMarkParamsForPostgres === false) skipAST = true
+    if (skipAST) return query
+    if (db.modifiedQueryCache[query]) return db.modifiedQueryCache[query]
+    try {
+      const modifiedQuery = await queryParser(query)
+      if (modifiedQuery) {
+        db.modifiedQueryCache[query] = modifiedQuery
+        return modifiedQuery
+      }
+    } catch (e) {
+      // the query could not be parsed, so use it unchanged
+    }
+    return query
   }
-  db.mariadb.query = async (query, params) => {
-    const uninitialized = notInitialized('mariadb', '🦭', 'MariaDB', db.mariadb.conn)
+
+  // every engine reports a query failure the same way, and none of them may let a driver level exception escape to the caller
+  async function runQuery (spec, query, params, run) {
+    const uninitialized = notInitialized(spec.engine, spec.emoji, spec.label, spec.handle())
     if (uninitialized) return uninitialized
     try {
-      let result
-      if (!query.trim().toLowerCase().startsWith('select') && params && typeof params[0] === 'object') {
-        // it's an array of objects or an array of arrays, so perform a transaction
-        try {
-          await db.mariadb.conn.beginTransaction()
-          for (let param of params) {
-            if (!Array.isArray(param)) param = Object.values(param)
-            await db.mariadb.conn.query(query, param)
-          }
-          await db.mariadb.conn.commit()
-        } catch (e) {
-          await db.mariadb.conn.rollback()
-          throw e
-        }
-      } else {
-        result = await db.mariadb.conn.query(query, params)
-      }
-      result = {
-        rows: result
-      }
-      return result
+      return await run()
     } catch (e) {
-      logger.error('🦭', 'MariaDB query error...')
+      logger.error(spec.emoji, `${spec.label} query error...`)
       logger.error('Query attempted: ', query)
       logger.error('Params supplied: ', params)
       logger.error(e)
@@ -136,71 +142,61 @@ async function multiDb (params) {
     }
   }
 
+  db.mariadb = {}
+  connected = await connectWithLadder(engines.mariadb, async credentials => {
+    if (isCli) {
+      credentials.multipleStatements = true
+      credentials.allowPublicKeyRetrieval = true
+    }
+    const { createPool } = multiDb.drivers.mariadb
+    db.mariadb.pool = await createPool(credentials)
+    db.mariadb.conn = await db.mariadb.pool.getConnection()
+  })
+  if (!connected && config.mariadb) reportInitFailure('mariadb', engines.mariadb.emoji, 'MariaDB')
+  db.mariadb.query = async (query, params) => runQuery(engines.mariadb, query, params, async () => {
+    let result
+    if (isTransaction(query, params)) {
+      try {
+        await db.mariadb.conn.beginTransaction()
+        for (const param of params) await db.mariadb.conn.query(query, positional(param))
+        await db.mariadb.conn.commit()
+      } catch (e) {
+        await db.mariadb.conn.rollback()
+        throw e
+      }
+    } else {
+      result = await db.mariadb.conn.query(query, params)
+    }
+    return { rows: result }
+  })
+
   db.mysql = {}
-  if (config.mysql) {
-    credentialsToTry = [
-      config.admin ? config.mysql.adminConfig : config.mysql.config, // default to admin config if the admin flag is passed
-      // try some default credentials if the above doesn't work
-      ...multiDb.defaultCredentials.mysql,
-      // if none of those worked, try either the admin credentials or the user credentials, whichever wasn't used above
-      config.admin ? config.mysql.config : config.mysql.adminConfig
-    ]
-  } else {
-    credentialsToTry = []
-  }
-  connected = false
-  for (let i = 0; i < credentialsToTry.length; i++) {
-    try {
-      if (isCli) credentialsToTry[i].multipleStatements = true
-      const { createPool } = multiDb.drivers.mysql
-      db.mysql.pool = await createPool(credentialsToTry[i])
-      db.mysql.conn = await db.mysql.pool.getConnection()
-      logger.log('🐬', ('MySQL database connected with user ' + credentialsToTry[i].user + ' to database ' + credentialsToTry[i].database).bold)
-      db.mysql.username = credentialsToTry[i].user
-      db.mysql.database = credentialsToTry[i].database
-      connected = true
-      break
-    } catch (e) {
-      // do nothing, try the next set of credentials
-    }
-  }
-  if (!connected && config.mysql) {
-    reportInitFailure('mysql', '🐬', 'MySQL')
-  }
-  db.mysql.query = async (query, params) => {
-    const uninitialized = notInitialized('mysql', '🐬', 'MySQL', db.mysql.conn)
-    if (uninitialized) return uninitialized
-    try {
-      let result
-      if (!query.trim().toLowerCase().startsWith('select') && params && typeof params[0] === 'object') {
-        // it's an array of objects or an array of arrays, so perform a transaction
-        try {
-          await db.mysql.conn.beginTransaction()
-          for (let param of params) {
-            if (!Array.isArray(param)) param = Object.values(param)
-            await db.mysql.conn.query(query, param)
-          }
-          await db.mysql.conn.commit()
-        } catch (e) {
-          await db.mysql.conn.rollback()
-          throw e
-        }
-      } else {
-        result = await db.mysql.conn.query(query, params)
+  connected = await connectWithLadder(engines.mysql, async credentials => {
+    if (isCli) credentials.multipleStatements = true
+    const { createPool } = multiDb.drivers.mysql
+    db.mysql.pool = await createPool(credentials)
+    db.mysql.conn = await db.mysql.pool.getConnection()
+  })
+  if (!connected && config.mysql) reportInitFailure('mysql', engines.mysql.emoji, 'MySQL')
+  db.mysql.query = async (query, params) => runQuery(engines.mysql, query, params, async () => {
+    let result
+    if (isTransaction(query, params)) {
+      try {
+        await db.mysql.conn.beginTransaction()
+        for (const param of params) await db.mysql.conn.query(query, positional(param))
+        await db.mysql.conn.commit()
+      } catch (e) {
+        await db.mysql.conn.rollback()
+        throw e
       }
-      result = {
-        full: result
-      }
-      result.rows = result.full?.[0]
-      return result
-    } catch (e) {
-      logger.error('🐬', 'MySQL query error...')
-      logger.error('Query attempted: ', query)
-      logger.error('Params supplied: ', params)
-      logger.error(e)
-      return { error: e }
+    } else {
+      result = await db.mysql.conn.query(query, params)
     }
-  }
+    // mysql2 hands back [rows, fields], so the rows are surfaced alongside the whole response rather than in place of it
+    const wrapped = { full: result }
+    wrapped.rows = wrapped.full?.[0]
+    return wrapped
+  })
 
   db.pglite = {}
   if (config.default === 'pglite' || config.pglite) {
@@ -208,142 +204,55 @@ async function multiDb (params) {
     if ((isCli && config.default === 'pglite') || fs.existsSync(resolvePath(config.pglite.config.database))) {
       const { PGlite } = multiDb.drivers.pglite
       db.pglite.db = new PGlite(resolvePath(config.pglite.config.database))
-      logger.log('⚡️', ('PGlite database connected to database ' + config.pglite.config.database).bold)
+      logger.log(engines.pglite.emoji, 'PGlite database connected to database ' + config.pglite.config.database)
       db.pglite.database = config.pglite.config.database
       connected = true
     }
-    if (!connected && config.pglite) {
-      reportInitFailure('pglite', '⚡️', 'PGlite')
-    }
+    if (!connected && config.pglite) reportInitFailure('pglite', engines.pglite.emoji, 'PGlite')
   }
-  db.pglite.query = async (query, params, skipAST) => {
-    const uninitialized = notInitialized('pglite', '⚡️', 'PGlite', db.pglite.db)
-    if (uninitialized) return uninitialized
-    try {
-      if (isCli) return await db.pglite.db.exec(query)
-      if (config.questionMarkParamsForPostgres === false) skipAST = true
-      let modifiedQuery
-      if (!skipAST) {
-        if (db.modifiedQueryCache[query]) {
-          modifiedQuery = db.modifiedQueryCache[query]
-        } else {
-          try {
-            modifiedQuery = await queryParser(query)
-          } catch (e) {
-            // do nothing
-          }
-        }
-      }
-      let queryToUse
-      if (modifiedQuery) {
-        db.modifiedQueryCache[query] = modifiedQuery
-        queryToUse = modifiedQuery
-      } else queryToUse = query
-      if (!query.trim().toLowerCase().startsWith('select') && params && typeof params[0] === 'object') {
-        // it's an array of objects or an array of arrays, so perform a transaction
-        await db.pglite.db.transaction(async (tx) => {
-          try {
-            for (let param of params) {
-              if (!Array.isArray(param)) param = Object.values(param)
-              await tx.query(queryToUse, param)
-            }
-          } catch (e) {
-            await tx.rollback()
-            throw e
-          }
-        })
-      } else {
-        return await db.pglite.db.query(queryToUse, params)
-      }
-    } catch (e) {
-      logger.error('⚡️', 'PGlite query error...')
-      logger.error('Query attempted: ', query)
-      logger.error('Params supplied: ', params)
-      logger.error(e)
-      return { error: e }
-    }
-  }
-
-  db.postgres = {}
-  if (config.postgres) {
-    credentialsToTry = [
-      config.admin ? config.postgres.adminConfig : config.postgres.config, // default to admin config if the admin flag is passed
-      // try some default credentials if the above doesn't work
-      ...multiDb.defaultCredentials.postgres,
-      // if none of those worked, try either the admin credentials or the user credentials, whichever wasn't used above
-      config.admin ? config.postgres.config : config.postgres.adminConfig
-    ]
-  } else {
-    credentialsToTry = []
-  }
-  connected = false
-  for (let i = 0; i < credentialsToTry.length; i++) {
-    try {
-      const { Pool } = multiDb.drivers.postgres
-      db.postgres.pool = new Pool(credentialsToTry[i])
-      db.postgres.client = await db.postgres.pool.connect()
-      db.postgres.client.on('error', (e) => {
-        logger.error('🐘', 'PostgreSQL error...')
-        logger.error(e)
-      })
-      logger.log('🐘', ('PostgreSQL database connected with user ' + credentialsToTry[i].user + ' to database ' + credentialsToTry[i].database).bold)
-      db.postgres.username = credentialsToTry[i].user
-      db.postgres.database = credentialsToTry[i].database
-      connected = true
-      break
-    } catch (e) {
-      // fail silently, try the next set of credentials
-    }
-  }
-  if (!connected && config.postgres) {
-    reportInitFailure('postgres', '🐘', 'PostgreSQL')
-  }
-  db.postgres.query = async (query, params, skipAST) => {
-    const uninitialized = notInitialized('postgres', '🐘', 'PostgreSQL', db.postgres.client)
-    if (uninitialized) return uninitialized
-    try {
-      if (config.questionMarkParamsForPostgres === false) skipAST = true
-      let modifiedQuery
-      if (!skipAST) {
-        if (db.modifiedQueryCache[query]) {
-          modifiedQuery = db.modifiedQueryCache[query]
-        } else {
-          try {
-            modifiedQuery = await queryParser(query)
-          } catch (e) {
-            // do nothing
-          }
-        }
-      }
-      let queryToUse
-      if (modifiedQuery) {
-        db.modifiedQueryCache[query] = modifiedQuery
-        queryToUse = modifiedQuery
-      } else queryToUse = query
-      if (!query.trim().toLowerCase().startsWith('select') && params && typeof params[0] === 'object') {
-        // it's an array of objects or an array of arrays, so perform a transaction
+  db.pglite.query = async (query, params, skipAST) => runQuery(engines.pglite, query, params, async () => {
+    if (isCli) return await db.pglite.db.exec(query)
+    const queryToUse = await rewriteForPostgres(query, skipAST)
+    if (isTransaction(query, params)) {
+      await db.pglite.db.transaction(async (tx) => {
         try {
-          await db.postgres.client.query('BEGIN')
-          for (let param of params) {
-            if (!Array.isArray(param)) param = Object.values(param)
-            await db.postgres.client.query(queryToUse, param)
-          }
-          await db.postgres.client.query('COMMIT')
+          for (const param of params) await tx.query(queryToUse, positional(param))
         } catch (e) {
-          await db.postgres.client.query('ROLLBACK')
+          await tx.rollback()
           throw e
         }
-      } else {
-        return await db.postgres.client.query(queryToUse, params)
-      }
-    } catch (e) {
-      logger.error('🐘', 'PostgreSQL query error...')
-      logger.error('Query attempted: ', query)
-      logger.error('Params supplied: ', params)
-      logger.error(e)
-      return { error: e }
+      })
+    } else {
+      return await db.pglite.db.query(queryToUse, params)
     }
-  }
+  })
+
+  db.postgres = {}
+  connected = await connectWithLadder(engines.postgres, async credentials => {
+    const { Pool } = multiDb.drivers.postgres
+    db.postgres.pool = new Pool(credentials)
+    db.postgres.client = await db.postgres.pool.connect()
+    db.postgres.client.on('error', (e) => {
+      logger.error(engines.postgres.emoji, 'PostgreSQL error...')
+      logger.error(e)
+    })
+  })
+  if (!connected && config.postgres) reportInitFailure('postgres', engines.postgres.emoji, 'PostgreSQL')
+  db.postgres.query = async (query, params, skipAST) => runQuery(engines.postgres, query, params, async () => {
+    const queryToUse = await rewriteForPostgres(query, skipAST)
+    if (isTransaction(query, params)) {
+      try {
+        await db.postgres.client.query('BEGIN')
+        for (const param of params) await db.postgres.client.query(queryToUse, positional(param))
+        await db.postgres.client.query('COMMIT')
+      } catch (e) {
+        await db.postgres.client.query('ROLLBACK')
+        throw e
+      }
+    } else {
+      return await db.postgres.client.query(queryToUse, params)
+    }
+  })
 
   db.sqlite = {}
   if (config.default === 'sqlite' || config.sqlite) {
@@ -356,49 +265,37 @@ async function multiDb (params) {
       } else {
         db.sqlite.db = new Database(resolvePath(config.sqlite.config.database), { fileMustExist: true })
       }
-      logger.log('🪶', ('SQLite database connected to database ' + config.sqlite.config.database).bold)
+      logger.log(engines.sqlite.emoji, 'SQLite database connected to database ' + config.sqlite.config.database)
       db.sqlite.database = config.sqlite.config.database
       connected = true
     } catch (e) {
       // do nothing
     }
-    if (!connected && config.sqlite) {
-      reportInitFailure('sqlite', '🪶', 'SQLite')
-    }
+    if (!connected && config.sqlite) reportInitFailure('sqlite', engines.sqlite.emoji, 'SQLite')
   }
-  db.sqlite.query = async (query, params) => {
-    const uninitialized = notInitialized('sqlite', '🪶', 'SQLite', db.sqlite.db)
-    if (uninitialized) return uninitialized
-    try {
-      let result
-      if (isCli) result = await db.sqlite.db.exec(query)
-      else {
-        if (!query.trim().toLowerCase().startsWith('select')) {
-          if (params && typeof params[0] === 'object') {
-            // it's an array of objects or an array of arrays, so perform a transaction
-            const transaction = await db.sqlite.db.prepare(query)
-            const transactionRunner = await db.sqlite.db.transaction((paramsArray) => {
-              for (const param of paramsArray) transaction.run(param)
-            })
-            result = transactionRunner(params)
-          } else {
-            result = await db.sqlite.db.prepare(query).run(params || [])
-          }
-        } else {
-          result = await db.sqlite.db.prepare(query).all(params || [])
-        }
-        result = {
-          rows: result
-        }
+  db.sqlite.query = async (query, params) => runQuery(engines.sqlite, query, params, async () => {
+    if (isCli) return await db.sqlite.db.exec(query)
+    let result
+    if (!query.trim().toLowerCase().startsWith('select')) {
+      if (params && typeof params[0] === 'object') {
+        // it's an array of objects or an array of arrays, so perform a transaction. the params are passed through untouched because sqlite binds named parameters such as @name from the object itself
+        const transaction = await db.sqlite.db.prepare(query)
+        const transactionRunner = await db.sqlite.db.transaction((paramsArray) => {
+          for (const param of paramsArray) transaction.run(param)
+        })
+        result = transactionRunner(params)
+      } else {
+        result = await db.sqlite.db.prepare(query).run(params || [])
       }
-      return result
-    } catch (e) {
-      logger.error('🪶', 'SQLite query error...')
-      logger.error('Query attempted: ', query)
-      logger.error('Params supplied: ', params)
-      logger.error(e)
-      return { error: e }
+    } else {
+      result = await db.sqlite.db.prepare(query).all(params || [])
     }
+    return { rows: result }
+  })
+
+  // expose each loaded driver module, as documented, so callers can reach the underlying library directly. an entry that is still a string never loaded, so it is left undefined rather than handing back a package name
+  for (const name of Object.keys(engines)) {
+    if (typeof multiDb.drivers[name] !== 'string') db[name].driver = multiDb.drivers[name]
   }
 
   const defaultDb = config.default
@@ -458,33 +355,26 @@ async function multiDb (params) {
 
   // universal end connection method
   db.endConnection = async () => {
-    // end MariaDB connection
-    if (db.mariadb.conn) {
-      await db.mariadb.conn.release()
-      await db.mariadb.pool.end()
-      logger.log('🔚', 'MariaDB connection ended.')
+    const closers = {
+      mariadb: async () => {
+        await db.mariadb.conn.release()
+        await db.mariadb.pool.end()
+      },
+      mysql: async () => {
+        await db.mysql.conn.release()
+        await db.mysql.pool.end()
+      },
+      pglite: async () => await db.pglite.db.close(),
+      postgres: async () => {
+        await db.postgres.client.release()
+        await db.postgres.pool.end()
+      },
+      sqlite: async () => await db.sqlite.db.close()
     }
-    // end MySQL connection
-    if (db.mysql.conn) {
-      await db.mysql.conn.release()
-      await db.mysql.pool.end()
-      logger.log('🔚', 'MySQL connection ended.')
-    }
-    // end PGlite connection
-    if (db.pglite.db) {
-      await db.pglite.db.close()
-      logger.log('🔚', 'PGlite connection ended.')
-    }
-    // end PostgreSQL connection
-    if (db.postgres.client) {
-      await db.postgres.client.release()
-      await db.postgres.pool.end()
-      logger.log('🔚', 'PostgreSQL connection ended.')
-    }
-    // end SQLite connection
-    if (db.sqlite.db) {
-      await db.sqlite.db.close()
-      logger.log('🔚', 'SQLite connection ended.')
+    for (const name of Object.keys(closers)) {
+      if (!engines[name].handle()) continue // never connected, so there is nothing to close
+      await closers[name]()
+      logger.log('🔚', `${engines[name].label} connection ended.`)
     }
   }
 
