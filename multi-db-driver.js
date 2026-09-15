@@ -1,9 +1,9 @@
 const process = require('process')
-const path = require('path')
 const fs = require('fs')
 const isCli = process.argv[1].slice(-6) === 'cli.js'
 const Logger = require('roosevelt-logger')
 const configFinder = require('./lib/configFinder')
+const resolvePath = require('./lib/resolvePath')
 const queryParser = require('./lib/queryParser')
 
 async function multiDb (params) {
@@ -18,7 +18,11 @@ async function multiDb (params) {
   }
 
   // attempt to load all the db drivers
+  //
+  // a driver that is still a string here has not been loaded yet, so a failure means its package is genuinely absent. on a later call the entry already holds the loaded module, and the load is skipped rather than counted as missing
+  const missingDrivers = {}
   for (const key in multiDb.drivers) {
+    const packageName = typeof multiDb.drivers[key] === 'string' ? multiDb.drivers[key] : null
     try {
       if (multiDb.drivers[key] === '@electric-sql/pglite') {
         multiDb.drivers[key] = await import(multiDb.drivers[key])
@@ -28,10 +32,31 @@ async function multiDb (params) {
         multiDb.drivers[key] = require(multiDb.drivers[key])
       }
     } catch (e) {
-      // the module isn't in node_modules, fail silently
-      // log that this db couldn't be initiatlized in a verbose logging mode only
-      logger.verbose(`${key} driver ${multiDb.drivers[key]} could not be initialized. Setting it to null.`)
+      if (packageName) missingDrivers[key] = packageName
+      // the module isn't in node_modules. this is only worth logging here in a verbose mode: whether it matters depends on whether the config actually asks for that database, which is reported per engine below
+      logger.verbose(`${key} driver ${multiDb.drivers[key]} could not be loaded.`)
     }
+  }
+
+  // a query against an engine that never initialized would otherwise fail deep inside the driver with something like "cannot read properties of undefined", which tells the caller nothing about the real cause
+  //
+  // returns the error result to hand back, or null when the engine is fine
+  function notInitialized (engine, emoji, label, handle) {
+    if (handle) return null
+    const missing = missingDrivers[engine]
+    const reason = missing
+      ? `its driver is not installed. Run: npm i ${installNameFor(missing)}`
+      : 'it is not connected. Check the errors above for why the connection could not be established.'
+    const error = new Error(`Cannot query ${label}: ${reason}`)
+    logger.error(emoji, error.message)
+    return { error }
+  }
+
+  // explain why an engine could not start. a driver package that is not installed needs completely different advice from a connection that was refused, and telling someone to check their config when the config is fine sends them to debug the wrong thing
+  function reportInitFailure (engine, emoji, label) {
+    const missing = missingDrivers[engine]
+    if (missing) logger.error(emoji, `Cannot use ${label}: its driver is not installed. Run: npm i ${installNameFor(missing)}`)
+    else logger.error(emoji, `Could not initialize ${label} module. Please make sure it is configured properly.`)
   }
 
   // normalize all db drivers to one api and initialize the db drivers
@@ -75,9 +100,11 @@ async function multiDb (params) {
     }
   }
   if (!connected && config.mariadb) {
-    logger.error('🦭', 'Could not initialize MariaDB module. Please make sure it is configured properly.')
+    reportInitFailure('mariadb', '🦭', 'MariaDB')
   }
   db.mariadb.query = async (query, params) => {
+    const uninitialized = notInitialized('mariadb', '🦭', 'MariaDB', db.mariadb.conn)
+    if (uninitialized) return uninitialized
     try {
       let result
       if (!query.trim().toLowerCase().startsWith('select') && params && typeof params[0] === 'object') {
@@ -138,9 +165,11 @@ async function multiDb (params) {
     }
   }
   if (!connected && config.mysql) {
-    logger.error('🐬', 'Could not initialize MySQL module. Please make sure it is configured properly.')
+    reportInitFailure('mysql', '🐬', 'MySQL')
   }
   db.mysql.query = async (query, params) => {
+    const uninitialized = notInitialized('mysql', '🐬', 'MySQL', db.mysql.conn)
+    if (uninitialized) return uninitialized
     try {
       let result
       if (!query.trim().toLowerCase().startsWith('select') && params && typeof params[0] === 'object') {
@@ -176,18 +205,20 @@ async function multiDb (params) {
   db.pglite = {}
   if (config.default === 'pglite' || config.pglite) {
     connected = false
-    if ((isCli && config.default === 'pglite') || fs.existsSync(path.normalize(config.pglite.config.database))) {
+    if ((isCli && config.default === 'pglite') || fs.existsSync(resolvePath(config.pglite.config.database))) {
       const { PGlite } = multiDb.drivers.pglite
-      db.pglite.db = new PGlite(config.pglite.config.database)
+      db.pglite.db = new PGlite(resolvePath(config.pglite.config.database))
       logger.log('⚡️', ('PGlite database connected to database ' + config.pglite.config.database).bold)
       db.pglite.database = config.pglite.config.database
       connected = true
     }
     if (!connected && config.pglite) {
-      logger.error('⚡️', 'Could not initialize PGlite module. Please make sure it is configured properly.')
+      reportInitFailure('pglite', '⚡️', 'PGlite')
     }
   }
   db.pglite.query = async (query, params, skipAST) => {
+    const uninitialized = notInitialized('pglite', '⚡️', 'PGlite', db.pglite.db)
+    if (uninitialized) return uninitialized
     try {
       if (isCli) return await db.pglite.db.exec(query)
       if (config.questionMarkParamsForPostgres === false) skipAST = true
@@ -265,9 +296,11 @@ async function multiDb (params) {
     }
   }
   if (!connected && config.postgres) {
-    logger.error('🐘', 'Could not initialize PostgreSQL module. Please make sure it is configured properly.')
+    reportInitFailure('postgres', '🐘', 'PostgreSQL')
   }
   db.postgres.query = async (query, params, skipAST) => {
+    const uninitialized = notInitialized('postgres', '🐘', 'PostgreSQL', db.postgres.client)
+    if (uninitialized) return uninitialized
     try {
       if (config.questionMarkParamsForPostgres === false) skipAST = true
       let modifiedQuery
@@ -318,10 +351,10 @@ async function multiDb (params) {
     try {
       const Database = multiDb.drivers.sqlite
       if (config.default === 'sqlite' && isCli) {
-        db.sqlite.db = new Database(config.sqlite.config.database)
+        db.sqlite.db = new Database(resolvePath(config.sqlite.config.database))
         db.sqlite.db.pragma('journal_mode = WAL') // enable WAL
       } else {
-        db.sqlite.db = new Database(config.sqlite.config.database, { fileMustExist: true })
+        db.sqlite.db = new Database(resolvePath(config.sqlite.config.database), { fileMustExist: true })
       }
       logger.log('🪶', ('SQLite database connected to database ' + config.sqlite.config.database).bold)
       db.sqlite.database = config.sqlite.config.database
@@ -330,10 +363,12 @@ async function multiDb (params) {
       // do nothing
     }
     if (!connected && config.sqlite) {
-      logger.error('🪶', 'Could not initialize SQLite module. Please make sure it is configured properly.')
+      reportInitFailure('sqlite', '🪶', 'SQLite')
     }
   }
   db.sqlite.query = async (query, params) => {
+    const uninitialized = notInitialized('sqlite', '🪶', 'SQLite', db.sqlite.db)
+    if (uninitialized) return uninitialized
     try {
       let result
       if (isCli) result = await db.sqlite.db.exec(query)
@@ -373,8 +408,7 @@ async function multiDb (params) {
   db.query = async (query, params, postprocess) => {
     if (!params || !Array.isArray(params)) {
       if (typeof params === 'function' && !postprocess) {
-        // params argument was skipped but the postprocess argument was not
-        // that means argument 2 is our postprocess function and params needs to be set to an empty array
+        // params argument was skipped but the postprocess argument was not. that means argument 2 is our postprocess function and params needs to be set to an empty array
         postprocess = params
       }
       params = [] // regardless of if the above if statement returns true or false, params being set to something other than an array is bad so we need to make sure it's an array
@@ -414,7 +448,7 @@ async function multiDb (params) {
   db.testConnection = async () => {
     logger.log('🔌', `Testing ${defaultDb} connection...`)
     const result = await db[defaultDb].query('select 1')
-    if (result) {
+    if (result && !result.error) { // a query that failed resolves to { error }, which is truthy
       logger.log('✅', (`Successfully connected to ${db[defaultDb].database}.`))
       return result
     } else {
@@ -457,7 +491,13 @@ async function multiDb (params) {
   return db
 }
 
-// declare supported db modules. if any is not present in package.json, it will be set to null
+// the package to install is not always the path that gets required: mysql2/promise lives inside the mysql2 package
+function installNameFor (requirePath) {
+  const parts = requirePath.split('/')
+  return requirePath.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]
+}
+
+// declare supported db modules. each entry is replaced with the loaded module on first use, and left as the package name if that package is not installed
 multiDb.drivers = {
   mariadb: 'mariadb',
   mysql: 'mysql2/promise',

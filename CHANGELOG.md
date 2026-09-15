@@ -1,3 +1,12 @@
+## 1.2.0
+
+- Fixed a bug that caused the `--create` CLI command to create MySQL and MariaDB users that could only connect from the database server's own host, which prevented the created user from logging in from anywhere else.
+- Fixed a bug that caused the `--dump-schema` and `--dump-data` CLI commands to ignore the configured host and port, always attempting to dump from the default port on localhost.
+- Fixed a bug that caused `testConnection` to report a successful connection when the connection test query had failed.
+- Fixed a bug that prevented `~` from working in file paths. Paths beginning with `~` are now expanded to the current user's home directory in SQLite and PGlite database paths, schema paths, the `--file`, `--dump-schema`, and `--dump-data` CLI arguments, and the `MULTI_DB_DRIVER_CONFIG_LOCATION` environment variable.
+- Improved the error reported when a configured database's driver is not installed: Multi-DB Driver now names the missing package and the command to install it, instead of reporting that the database is configured improperly. Queries against such a database report the same thing, rather than failing with an error about an undefined property.
+- Updated dependencies.
+
 ## 1.1.3
 
 - Fixed a bug that prevented errors from surfacing at times.

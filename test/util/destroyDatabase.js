@@ -1,7 +1,6 @@
 const fs = require('fs')
-const isDocker = process.argv.includes('--docker') || false
 const path = require('path')
-const { spawn } = require('child_process')
+const runCli = require(path.join(__dirname, 'runCli.js'))
 
 // function that destroys database using CLI script
 module.exports = async (db, suppressLogs, enableVerbose) => {
@@ -12,34 +11,16 @@ module.exports = async (db, suppressLogs, enableVerbose) => {
   // override default in config
   if (db) fs.writeFileSync(path.normalize('.multi-db-driver-config.json'), JSON.stringify(data, null, 2))
 
-  let destroyDatabaseChildProcess
-  if (suppressLogs) destroyDatabaseChildProcess = isDocker && (db !== 'pglite' && db !== 'sqlite') ? spawn('docker', ['exec', '-i', `${db}-multidb-tests`, 'bin/bash', '-c', 'cd multi-db && node cli.js --destroy --suppress-logs --suppress-errors'], { shell: false }) : spawn('node', ['cli.js', '--destroy', '--suppress-logs', '--suppress-errors'], { shell: false }) // run node cli.js --destroy as a child process with suppress-logger flags
-  else if (enableVerbose) destroyDatabaseChildProcess = isDocker && (db !== 'pglite' && db !== 'sqlite') ? spawn('docker', ['exec', '-i', `${db}-multidb-tests`, 'bin/bash', '-c', 'cd multi-db && node cli.js --destroy --enable-verbose'], { shell: false }) : spawn('node', ['cli.js', '--destroy', '--enable-verbose'], { shell: false }) // run node cli.js --destroy as a child process
-  else destroyDatabaseChildProcess = isDocker && (db !== 'pglite' && db !== 'sqlite') ? spawn('docker', ['exec', '-i', `${db}-multidb-tests`, 'bin/bash', '-c', 'cd multi-db && node cli.js --destroy'], { shell: false }) : spawn('node', ['cli.js', '--destroy'], { shell: false }) // run node cli.js --destroy as a child process
-  destroyDatabaseChildProcess.stdin.setEncoding('utf-8')
-  return new Promise((resolve, reject) => {
-    let droppedDatabase
-    destroyDatabaseChildProcess.stdout.on('data', (data) => {
-      if (data.toString().includes('🤔')) {
-        destroyDatabaseChildProcess.stdin.write('y\n') // answers yes to prompt
-        destroyDatabaseChildProcess.stdin.end()
-        destroyDatabaseChildProcess.stdout.on('data', (data) => {
-          if (data.toString().includes('💀') || data.toString().includes('Dropping')) {
-            const splitDroppedData = data.toString().split(' ')
-            droppedDatabase = db === 'pglite' || db === 'sqlite' ? splitDroppedData[3] : splitDroppedData[6]
-          }
-        })
-      }
-    })
-    destroyDatabaseChildProcess.stderr.on('data', (data) => {
-      if (data.toString().includes('🪶') || data.toString().includes('initialize')) {
-        // do nothing
-      } else {
-        resolve('error') // if error return 'error'
-      }
-    })
-    destroyDatabaseChildProcess.on('exit', () => {
-      resolve(droppedDatabase)
-    })
-  })
+  const flags = []
+  if (suppressLogs) flags.push('--suppress-logs', '--suppress-errors')
+  else if (enableVerbose) flags.push('--enable-verbose')
+
+  const result = await runCli(['--destroy', ...flags]) // run node cli.js --destroy as a child process
+  if (result.failed) return 'error'
+
+  // report which database the cli said it dropped. the file backed engines name only a database; the server backed ones name a user first
+  const dropped = db === 'pglite' || db === 'sqlite'
+    ? result.stdout.match(/Dropping (\S+) database/)
+    : result.stdout.match(/Dropping \S+ user and (\S+) database/)
+  return dropped ? dropped[1] : undefined
 }
