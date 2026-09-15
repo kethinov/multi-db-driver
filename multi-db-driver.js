@@ -1,6 +1,6 @@
 const process = require('process')
 const fs = require('fs')
-const isCli = process.argv[1].slice(-6) === 'cli.js'
+const isCli = process.argv[1]?.slice(-6) === 'cli.js' // argv[1] is undefined in the repl and under node -e, where there is no script path
 const Logger = require('roosevelt-logger')
 const configFinder = require('./lib/configFinder')
 const resolvePath = require('./lib/resolvePath')

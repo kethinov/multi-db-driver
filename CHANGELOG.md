@@ -1,3 +1,8 @@
+## 1.2.1
+
+- Fixed a bug that prevented Multi-DB Driver from being loaded at all in contexts where `process.argv[1]` is undefined, such as the Node REPL or `node -e`.
+- Reduced the size of the published npm package by excluding the test suite and development tooling from it.
+
 ## 1.2.0
 
 - Fixed a bug that caused the `--create` CLI command to create MySQL and MariaDB users that could only connect from the database server's own host, which prevented the created user from logging in from anywhere else.
