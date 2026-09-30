@@ -1,3 +1,9 @@
+## 1.4.0
+
+- Breaking: Changed error behavior so that a query that fails now throws, rather than logging the error and resolving to `{ error }`, which is what every database driver underneath does, and what code written against one expects. Code that did not check for `{ error }` carried on as though a failed query had worked. A query against a database whose driver is not installed or that never connected, and a query argument that is not a query, throw too. The new `throwOnError` param controls this: set it to `false` to restore the old behavior. The CLI scripts keep the old behavior.
+- Added `db.transaction(work)`, which runs several queries, including different statements, as one transaction on one connection, committing them once `work` resolves and rolling them back if it throws. Transactions made by passing an array of rows to `db.query()` run one statement once for each row, and still work as before.
+- Updated dependencies.
+
 ## 1.3.0
 
 - Breaking: Apps no longer fall back to guessed credentials when their configured credentials fail, unless the `NODE_ENV` environment variable is set to `development`. The new `guessCredentials` param controls this: set it to `true` to always guess, which restores the old behavior, `'development'` to guess only in development, which is the default for apps, or `false` to never guess, including from the CLI. A warning is now logged whenever a guessed set of credentials is the one that connects.

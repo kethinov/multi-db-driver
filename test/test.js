@@ -460,11 +460,12 @@ describe('multi-db-driver', function () {
     assert.equal(JSON.stringify(db.config[db.config.default]).trim(), JSON.stringify(nestedConfig[nestedConfig.default]).trim()) // check if nested config was used in db connection
   })
 
-  it('should print error due to falsey query', async function () {
+  it('should print error due to falsey query, with throwOnError off', async function () {
     await createDatabase('sqlite') // create database
 
     // connect to database with loggerConfig
     const db = await require('../multi-db-driver')({
+      throwOnError: false, // resolving to nothing and logging, rather than throwing, which is the default
       loggerConfig: {
         log: false,
         error: false,
@@ -481,11 +482,12 @@ describe('multi-db-driver', function () {
     assert.equal(!!result, false) // check if result is falsey
   })
 
-  it('should print error due to malformed query', async function () {
+  it('should print error due to malformed query, with throwOnError off', async function () {
     await createDatabase('sqlite') // create database
 
     // connect to database with loggerConfig
     const db = await require('../multi-db-driver')({
+      throwOnError: false, // resolving to nothing and logging, rather than throwing, which is the default
       loggerConfig: {
         log: false,
         error: false,
@@ -502,11 +504,12 @@ describe('multi-db-driver', function () {
     assert.equal(!!result, false) // check if result is falsey
   })
 
-  it('should print error due to invalid query type', async function () {
+  it('should print error due to invalid query type, with throwOnError off', async function () {
     await createDatabase('sqlite') // create database
 
     // connect to database with loggerConfig
     const db = await require('../multi-db-driver')({
+      throwOnError: false, // resolving to nothing and logging, rather than throwing, which is the default
       loggerConfig: {
         log: false,
         error: false,
@@ -874,7 +877,7 @@ const sqlEngines = [
     engine: 'sqlite',
     handle: db => db.sqlite.db,
     rollback: false, // sqlite has never had a rollback test
-    transaction: { placeholders: '(@name, @description)', perRow: true },
+    transaction: { placeholders: '(@name, @description)' },
     // sqlite has no host to point at a dead server, so a path that cannot be opened is what makes its config bad
     badConfig: () => ({ config: { database: './test/sqlite-db/path-doesnt-exist/sqlite_multi_db_automated_tests.sqlite' } }),
     extraTests (spec) {
@@ -940,20 +943,11 @@ for (const spec of sqlEngines) {
       const transaction = spec.transaction || {}
       const placeholders = transaction.placeholders || '(?, ?)'
 
-      // insert values into table. most drivers take the whole array in one call; sqlite binds named params a row at a time
-      if (transaction.perRow) {
-        for (let i = 0; i < values.length; i++) {
-          await db.query(`insert into test_table (
-            name,
-            description
-          ) values ${placeholders}`, values)
-        }
-      } else {
-        await db.query(`insert into test_table (
-          name,
-          description
-        ) values ${placeholders}`, values)
-      }
+      // insert values into table, every driver taking the whole array in one call. sqlite used to be given it once for each row, which inserted every row three times, and only passed because the second and third tries failed on the table's unique names and resolved to an error nothing looked at
+      await db.query(`insert into test_table (
+        name,
+        description
+      ) values ${placeholders}`, values)
 
       const result = await db.query('select * from test_table') // select all values from table
       await db.endConnection() // end connection
@@ -979,17 +973,64 @@ for (const spec of sqlEngines) {
       assert.equal(result.rows.length, 0) // check if table has 0 rows
     })
 
+    it('should run several different statements as one transaction, committing them together', async function () {
+      await createDatabase(spec.engine) // create database
+      const db = await connectTo(spec)
+      const result = await db.transaction(async tx => {
+        await tx.query('insert into test_table (name, description) values (?, ?)', ['magnus', 'chess master'])
+        await tx.query('update test_table set description = ? where name = ?', ['grandmaster', 'magnus'])
+        const { rows } = await tx.query('select * from test_table') // the transaction sees its own changes
+        return rows.length
+      })
+      const after = await db.query('select * from test_table')
+      await db.endConnection() // end connection
+      assert.equal(result, 1) // what the work returned
+      assert.deepEqual(after.rows, [{ name: 'magnus', description: 'grandmaster' }])
+    })
+
+    it('should roll back a transaction whose work throws, throwing its error, or resolving to it with throwOnError off', async function () {
+      await createDatabase(spec.engine) // create database
+      const db = await connectTo(spec, { throwOnError: false })
+      const result = await db.transaction(async tx => {
+        await tx.query('insert into test_table (name, description) values (?, ?)', ['magnus', 'chess master'])
+        throw new Error('stop')
+      })
+      const failed = await db.transaction(async tx => {
+        await tx.query('insert into test_table (name, description) values (?, ?)', ['nick', 'software engineer'])
+        await tx.query('inser into test_table (name) values (?)', ['typo']) // a query in a transaction that fails throws, which ends it
+      })
+      const after = await db.query('select * from test_table')
+      await db.endConnection() // end connection
+      assert.equal(result.error.message, 'stop')
+      assert.ok(failed.error)
+      assert.deepEqual(after.rows, []) // neither transaction's insert was kept
+
+      const throwing = await connectTo(spec) // which throws, by default
+      await assert.rejects(throwing.transaction(async () => { throw new Error('stop') }), /stop/)
+      await throwing.endConnection()
+    })
+
+    it('should throw a failed query, by default, rather than resolving to the error', async function () {
+      await createDatabase(spec.engine) // create database
+      const db = await connectTo(spec)
+      await assert.rejects(db.query('selec * from test_table'))
+      await assert.rejects(db.query({ nothing: 'here' }), /db\.query called with/) // a query that could not be run at all
+      const { rows } = await db.query('select * from test_table') // and one that works resolves as always
+      await db.endConnection() // end connection
+      assert.deepEqual(rows, [])
+    })
+
     if (spec.rollback !== false) {
       it('should roll back transaction due to error', async function () {
         await createDatabase(spec.engine) // create database
         const db = await connectTo(spec)
         const dbBeforeState = await db.query('select * from test_table') // select all values from table
 
-        // insert values into table with a typo, so the transaction has to roll back
-        await db.query(`inser into test_table (
+        // insert values into table with a typo, so the transaction has to roll back, and throws
+        await assert.rejects(db.query(`inser into test_table (
           name,
           description
-        ) values (?, ?)`, values)
+        ) values (?, ?)`, values))
 
         const dbAfterState = await db.query('select * from test_table') // select all values from table
         await db.endConnection() // end connection
@@ -1057,6 +1098,15 @@ describe('PGlite', function () {
     const result = insertValues.stdout.toString()
     const splitResult = result.trimEnd().split(' ')
     assert.deepEqual(splitResult[0], splitResult[1])
+  })
+
+  it('should run several different statements as one transaction, and roll one back whose work throws', async function () {
+    const run = spawnSync('node', ['./test/util/pgliteTransaction.js'], plainOutput)
+    const result = JSON.parse(run.stdout.toString())
+    assert.equal(result.committed, 1)
+    assert.equal(result.rolledBack, 'stop')
+    assert.equal(result.thrown, 'stop')
+    assert.deepEqual(result.rows, [{ name: 'magnus', description: 'grandmaster' }])
   })
 
   it('should print errors due to invalid SQL syntax', async function () {

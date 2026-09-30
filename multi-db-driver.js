@@ -12,6 +12,9 @@ async function multiDb (params) {
 
   const config = await configFinder(logger, params) // find config
 
+  // whether a query that fails throws, which is how code written against a database driver expects a failure to be reported, and is what every driver underneath does, rather than resolving to { error }, which code has to remember to look for, and otherwise carries on past as though the query worked. on by default for apps. the cli keeps resolving to { error }, since its steps are written for it, such as dropping a user that may not be there
+  const throwOnError = config.throwOnError ?? !isCli
+
   if (config.loggerConfig) {
     if (config.loggerConfig.log === false) logger.log = function () {}
     if (config.loggerConfig.warn === false) logger.warn = function () {}
@@ -45,6 +48,7 @@ async function multiDb (params) {
       ? `its driver is not installed. Run: npm i ${installNameFor(missing)}`
       : 'it is not connected. Check the errors above for why the connection could not be established.'
     const error = new Error(`Cannot query ${label}: ${reason}`)
+    if (throwOnError) throw error
     logger.error(emoji, error.message)
     return { error }
   }
@@ -163,13 +167,14 @@ async function multiDb (params) {
     }
   }
 
-  // every engine reports a query failure the same way, and none of them may let a driver level exception escape to the caller
+  // every engine reports a query failure the same way: it throws, since throwOnError is on by default, and is not logged, since the app decides what to do with it. with throwOnError off, as the cli has it, no driver level exception escapes to the caller: a failed query is logged and resolves to { error }
   async function runQuery (spec, query, params, run) {
     const uninitialized = notInitialized(spec.engine, spec.emoji, spec.label, spec.handle())
     if (uninitialized) return uninitialized
     try {
       return await run()
     } catch (e) {
+      if (throwOnError) throw e
       logger.error(spec.emoji, `${spec.label} query error...`)
       logger.error('Query attempted: ', query)
       logger.error('Params supplied: ', params)
@@ -352,20 +357,100 @@ async function multiDb (params) {
         return postprocess(defaultDb, result)
       } else if (!query[defaultDb]) {
         // neither the default db query string nor a default query string is specified
-        logger.error('db.query called with argument that was falsey.')
+        malformed('db.query called with argument that was falsey.')
       } else {
-        logger.error('db.query called with argument malformed argument.')
+        malformed('db.query called with argument malformed argument.')
       }
     } else {
-      logger.error('db.query called with argument malformed argument.')
+      malformed('db.query called with argument malformed argument.')
+    }
+  }
+
+  // a query that could not be run at all, which throws, or is logged with throwOnError off, the same as a query that fails
+  function malformed (message) {
+    if (throwOnError) throw new Error(message)
+    logger.error(message)
+  }
+
+  // runs several queries, which can be different statements, as one transaction against the default database: work(tx) is called with a tx whose query(query, params) runs each of them on the same connection, and the transaction is committed once work resolves, or rolled back if it throws, with what work returned, or its error, handed back to the caller
+  //
+  // a query in a transaction always throws when it fails, whatever the throwOnError param says, since that is what stops the rest of the transaction. the transaction itself, having rolled back, then throws, unless throwOnError is off, when it logs the error and resolves to { error }, the same as a single query
+  //
+  // sqlite has one connection, which queries run outside the transaction while it is open would also go over, so they would be part of it. keep other queries from running while a sqlite transaction is open
+  db.transaction = async work => {
+    const engine = engines[defaultDb]
+    const uninitialized = notInitialized(defaultDb, engine.emoji, engine.label, engine.handle())
+    if (uninitialized) return uninitialized
+    try {
+      return await transactions[defaultDb](work)
+    } catch (e) {
+      if (throwOnError) throw e
+      logger.error(engine.emoji, `${engine.label} transaction error...`)
+      logger.error(e)
+      return { error: e }
+    }
+  }
+
+  const transactions = {
+    postgres: async work => {
+      const client = await db.postgres.pool.connect()
+      try {
+        await client.query('BEGIN')
+        const result = await work({ query: async (query, params, skipRewrite) => client.query(rewriteForPostgres(query, skipRewrite), params || []) })
+        await client.query('COMMIT')
+        return result
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {}) // a connection that failed may not take a rollback either, and its first error is the one worth reporting
+        throw e
+      } finally {
+        client.release()
+      }
+    },
+    pglite: async work => db.pglite.db.transaction(tx => work({ query: async (query, params, skipRewrite) => tx.query(rewriteForPostgres(query, skipRewrite), params || []) })), // pglite rolls back itself when work throws
+    mariadb: async work => onConnection(await db.mariadb.pool.getConnection(), work, async (connection, query, params) => ({ rows: await connection.query(query, params || []) })),
+    mysql: async work => onConnection(await db.mysql.pool.getConnection(), work, async (connection, query, params) => {
+      const full = await connection.query(query, params || [])
+      return { full, rows: full[0] } // as a single query hands them back
+    }),
+    sqlite: async work => {
+      const sqlite = db.sqlite.db
+      sqlite.exec('BEGIN')
+      try {
+        const result = await work({ query: async (query, params) => ({ rows: query.trim().toLowerCase().startsWith('select') ? sqlite.prepare(query).all(params || []) : sqlite.prepare(query).run(params || []) }) })
+        sqlite.exec('COMMIT')
+        return result
+      } catch (e) {
+        if (sqlite.inTransaction) sqlite.exec('ROLLBACK')
+        throw e
+      }
+    }
+  }
+
+  // a mariadb or mysql transaction, on a connection checked out of the pool for it
+  async function onConnection (connection, work, run) {
+    try {
+      await connection.beginTransaction()
+      const result = await work({ query: async (query, params) => run(connection, query, params) })
+      await connection.commit()
+      return result
+    } catch (e) {
+      await connection.rollback().catch(() => {})
+      throw e
+    } finally {
+      connection.release()
     }
   }
 
   // universal test conenction method
   db.testConnection = async () => {
     logger.log('🔌', `Testing ${defaultDb} connection...`)
-    const result = await db[defaultDb].query('select 1')
-    if (result && !result.error) { // a query that failed resolves to { error }, which is truthy
+    let result
+    try {
+      result = await db[defaultDb].query('select 1')
+    } catch (e) {
+      result = { error: e } // reported below the same whichever way the query said it failed
+    }
+    if (result && !result.error) { // a query that failed resolves to { error } with throwOnError off, which is truthy
       logger.log('✅', (`Successfully connected to ${db[defaultDb].database}.`))
       return result
     } else {

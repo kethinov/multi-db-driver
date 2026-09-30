@@ -32,6 +32,8 @@ See "Configuration" for information about how to set up a Multi-DB Driver config
 
 ## Performing database queries
 
+A query that fails throws, so catch it where you have something better to do than let it fail, such as telling someone what went wrong. See `throwOnError` in the [configuration docs](./CONFIGURATION.md) for resolving to `{ error }` instead.
+
 The below examples show how to use Multi-DB Driver to query your database(s) from the simplest usage to the most complex, demonstrating how this module focuses on adding complexity only when needed as a progressive enhancement atop simpler, more concise syntax.
 
 ### Example of one universal query that works with any database you set in your config
@@ -101,6 +103,24 @@ This supplies an object instead of a string to the query argument.
 It also combines all the other above features too, showing a maximally featureful and flexible version of the query method.
 
 By default Multi-DB Driver will rewrite the query under the hood to use `$1` instead of `?` for queries being executed against PostgreSQL and PGlite. Only the placeholders are changed, and a query already written with `$1` style placeholders is left untouched. You can disable this behavior by setting `questionMarkParamsForPostgres` to `false` in your Multi-DB Driver config, or by setting `disableQuestionMarkParamsForPostgres` to `true` at the query level in the query object.
+
+### Transactions
+
+To run several queries as one transaction, which are committed together or not at all, pass a function to `db.transaction()`. It is called with a `tx` whose `query()` runs each query on the same connection. The transaction is committed once the function resolves, and rolled back if it throws, and `db.transaction()` resolves to what the function returned.
+
+```javascript
+const newId = await db.transaction(async tx => {
+  const { rows } = await tx.query('insert into orders (customer) values (?) returning id', ['someone'])
+  await tx.query('update customers set orders = orders + 1 where name = ?', ['someone'])
+  return rows[0].id
+})
+```
+
+Unlike the transactions below, made by passing an array of rows to `db.query()`, which run one statement once for each row, the queries can be different statements, and each can use what the ones before it returned.
+
+A query in a transaction always throws when it fails, whatever `throwOnError` says, since that is what stops the rest of the transaction. The transaction then rolls back, and `db.transaction()` throws the error, or resolves to `{ error }` with `throwOnError` off.
+
+`tx.query()` takes the same query and params as `db.query()`, against your default database. SQLite has only the one connection, so a query run outside the transaction while it is open would be part of it. Keep other queries from running while a SQLite transaction is open.
 
 ## CLI scripts
 
