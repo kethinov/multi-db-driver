@@ -34,10 +34,14 @@ async function insertValuesIntoPgliteTable () {
     ) values (?, ?)`, values)
   } else if (process.argv[2] === '--transaction-rollback') {
     dbBeforeState = await db.query('select * from test_table') // select all values from table
-    await db.query(`inser into test_table (
-      name,
-      description
-    ) values (?, ?)`, values)
+    try {
+      await db.query(`inser into test_table (
+        name,
+        description
+      ) values (?, ?)`, values)
+    } catch {
+      // which throws, having rolled back, which is what is checked below
+    }
   } else {
     for (let i = 0; i < values.length; i++) {
       await db.query(`insert into test_table (

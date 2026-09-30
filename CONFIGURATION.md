@@ -51,6 +51,8 @@ loggerConfig: {
   - A query that already uses `$1` style placeholders is left untouched, so you can write native PostgreSQL queries without turning this off.
   - The jsonb `?` operator on its own cannot be told apart from a placeholder, so a query that uses it needs `disableQuestionMarkParamsForPostgres` set in its query object.
 
+- `throwOnError` *[Boolean]*: Throw when a query fails, which is what every database driver underneath does, and what code written against one expects. A failed query is not logged then, since the code that catches it decides what to do with it. A query against a database whose driver is not installed or that never connected, and a query argument that is not a query, throw too. Set it to `false` to have a failed query logged and resolve to `{ error }` instead, which code then has to check for, or it carries on as though the query had worked, such as telling someone that what failed to save was saved. Default: `true` for apps, `false` for the CLI scripts.
+
 - `mergeConfig` *[Boolean]*: Merge config values passed via constructor or environment variable with any `.multi-db-config.json` or `.multi-db-driver-config.json` file detected in your app's directory structure. Default: `true`.
 
 ### Example configs
