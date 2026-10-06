@@ -1,4 +1,11 @@
-## 1.4.0
+## 2.1.0
+
+- Added `multiDb.setup(params)`, which does what the CLI scripts do, from a script of your own: creating and dropping the user and the database, loading SQL into it, and dumping it out. Each step is safe to run again. See [setting up a database from a script](https://rooseveltframework.org/docs/multi-db-driver/latest/usage/#setting-up-a-database-from-a-script).
+- Changed `guessCredentials` to guess at the port of the app's server, rather than at each database's default port, where another server could be.
+- Changed `guessCredentials` to try PostgreSQL's unix sockets first, in `/var/run/postgresql` and `/tmp`, as the user running the script and as `postgres`, at the port of the app's server. This is how the admin connection works on most Linux installs, and on Postgres.app and Homebrew, with no password.
+- Updated dependencies.
+
+## 2.0.0
 
 - Breaking: Changed error behavior so that a query that fails now throws, rather than logging the error and resolving to `{ error }`, which is what every database driver underneath does, and what code written against one expects. Code that did not check for `{ error }` carried on as though a failed query had worked. A query against a database whose driver is not installed or that never connected, and a query argument that is not a query, throw too. The new `throwOnError` param controls this: set it to `false` to restore the old behavior. The CLI scripts keep the old behavior.
 - Added `db.transaction(work)`, which runs several queries, including different statements, as one transaction on one connection, committing them once `work` resolves and rolling them back if it throws. Transactions made by passing an array of rows to `db.query()` run one statement once for each row, and still work as before.

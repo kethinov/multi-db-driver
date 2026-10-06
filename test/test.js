@@ -346,11 +346,11 @@ describe('CLI', function () {
     assert.equal(result, 'error')
   })
 
-  itIf('postgres')('should run --create CLI script and print error due to undefined schema', async function () {
+  itIf('postgres')('should run --create CLI script without a schema, creating the user and the database alone', async function () {
     process.env.MULTI_DB_DRIVER_CONFIG_LOCATION = './test/configs/.multi-db-driver-config-no-schema.json' // env var for config location
     const result = await createDatabase('sqlite') // create database
     delete process.env.MULTI_DB_DRIVER_CONFIG_LOCATION // delete env var
-    assert.equal(result, 'error') // check if result equals 'executed'
+    assert.equal(result, 'created')
   })
 
   itIf('postgres')('should run --create CLI script and print error due to invalid schema syntax', async function () {
@@ -692,6 +692,150 @@ describe('multi-db-driver', function () {
 })
 
 // which copy of a driver gets loaded needs no server either, only a directory that stands in for an app
+// setting up a database from a script rather than the cli. see lib/setup.js
+describe('Setup', function () {
+  const config = engine => ({ mergeConfig: false, default: engine, [engine]: fixture.configs[engine], loggerConfig: { log: false, warn: false } })
+  const scratch = path.join(__dirname, 'setup-scratch')
+
+  before(() => fs.mkdirSync(scratch, { recursive: true }))
+  after(() => fs.rmSync(scratch, { recursive: true, force: true }))
+
+  itIf('postgres')('should create a user and a database that are not there, leave ones that are, and drop them', async function () {
+    const setup = await multiDb.setup(config('postgres'))
+    try {
+      await setup.dropDatabase()
+      await setup.dropUser()
+      assert.equal(await setup.userExists(), false)
+      assert.equal(await setup.databaseOwner(), null)
+
+      for (let i = 0; i < 2; i++) { // a second time changes nothing
+        await setup.createUser()
+        await setup.createDatabase()
+      }
+      assert.equal(await setup.userExists(), true)
+      assert.equal(await setup.databaseOwner(), fixture.configs.postgres.config.user)
+      assert.ok((await setup.connectedAs()).user)
+
+      // the app's user can create things in it, which postgresql 15 and newer otherwise only lets the owner of its public schema do
+      const app = await multiDb({ mergeConfig: false, default: 'postgres', postgres: { config: fixture.configs.postgres.config }, loggerConfig: { log: false } })
+      await app.query('create table setup_check (id integer)')
+      await app.endConnection()
+
+      await setup.dropDatabase()
+      await setup.dropUser()
+      assert.equal(await setup.databaseOwner(), null)
+      assert.equal(await setup.userExists(), false)
+    } finally {
+      await setup.close()
+    }
+  })
+
+  itIf('postgres')('should set the password of a user that is there to the one given', async function () {
+    const setup = await multiDb.setup(config('postgres'))
+    const { user, database } = fixture.configs.postgres.config
+    try {
+      await setup.createUser({ user, password: 'an old password' })
+      await setup.createDatabase()
+      await setup.createUser() // the configured password
+      const app = await multiDb({ mergeConfig: false, default: 'postgres', guessCredentials: false, postgres: { config: fixture.configs.postgres.config }, loggerConfig: { log: false } })
+      assert.equal(app.postgres.database, database)
+      await app.endConnection()
+    } finally {
+      await setup.dropDatabase()
+      await setup.dropUser()
+      await setup.close()
+    }
+  })
+
+  itIfDump('postgres')('should dump a database and load it into another, data and all, in a file any version of psql can load', async function () {
+    const setup = await multiDb.setup(config('postgres'))
+    const dump = path.join(scratch, 'dump.sql')
+    try {
+      await setup.createUser()
+      await setup.createDatabase()
+      const app = await multiDb({ mergeConfig: false, default: 'postgres', postgres: { config: fixture.configs.postgres.config }, loggerConfig: { log: false } })
+      await app.query('create table setup_rows (id integer, name text)')
+      await app.query('insert into setup_rows values (1, \'one\'), (2, \'two\')')
+      await app.endConnection()
+
+      await setup.dump(dump)
+      const text = fs.readFileSync(dump, 'utf8')
+      assert.match(text, /COPY public\.setup_rows/) // its data, which only psql can load
+      assert.doesNotMatch(text, /^\\(un)?restrict /m) // which pg_dump 17.6 and newer write, and older versions of psql refuse
+
+      await setup.dropDatabase()
+      await setup.createDatabase()
+      await setup.load(dump)
+      const reloaded = await multiDb({ mergeConfig: false, default: 'postgres', postgres: { config: fixture.configs.postgres.config }, loggerConfig: { log: false } })
+      assert.deepEqual((await reloaded.query('select id, name from setup_rows order by id')).rows, [{ id: 1, name: 'one' }, { id: 2, name: 'two' }])
+      await reloaded.endConnection()
+    } finally {
+      await setup.dropDatabase()
+      await setup.dropUser()
+      await setup.close()
+    }
+  })
+
+  itIfDump('postgres')('should dump and load with the app\'s own credentials alone, without connecting as an admin', async function () {
+    const setup = await multiDb.setup(config('postgres'))
+    const dump = path.join(scratch, 'app-only.sql')
+    try {
+      await setup.createUser()
+      await setup.createDatabase()
+    } finally {
+      await setup.close()
+    }
+    // admin credentials that cannot connect, and no guessing, so that any step needing an admin would fail
+    const appOnly = await multiDb.setup({ ...config('postgres'), guessCredentials: false, postgres: { ...fixture.configs.postgres, adminConfig: { ...fixture.configs.postgres.adminConfig, password: 'not the password' } } })
+    try {
+      await appOnly.dump(dump)
+      await appOnly.load(dump)
+    } finally {
+      await appOnly.close()
+    }
+    const cleanup = await multiDb.setup(config('postgres'))
+    await cleanup.dropDatabase()
+    await cleanup.dropUser()
+    await cleanup.close()
+  })
+
+  itIfDump('postgres')('should refuse to dump into a folder that is not there, rather than making it', async function () {
+    const setup = await multiDb.setup(config('postgres'))
+    try {
+      await setup.createUser()
+      await setup.createDatabase()
+      await assert.rejects(setup.dump(path.join(scratch, 'no-such-folder', 'dump.sql')))
+      assert.equal(fs.existsSync(path.join(scratch, 'no-such-folder')), false)
+    } finally {
+      await setup.dropDatabase()
+      await setup.dropUser()
+      await setup.close()
+    }
+  })
+
+  it('should create, load, and drop a SQLite database without connecting as an admin', async function () {
+    const database = path.join(scratch, 'setup.sqlite')
+    const schema = path.join(scratch, 'schema.sql')
+    fs.writeFileSync(schema, 'create table setup_rows (id integer); insert into setup_rows values (1);')
+    const setup = await multiDb.setup({ mergeConfig: false, default: 'sqlite', sqlite: { config: { database } }, loggerConfig: { log: false } })
+    try {
+      await setup.createDatabase()
+      await setup.load(schema)
+      assert.equal(await setup.databaseOwner(), true)
+      await setup.dropDatabase()
+      assert.equal(await setup.databaseOwner(), null)
+    } finally {
+      await setup.close()
+    }
+  })
+
+  it('should try unix sockets first when guessing postgresql credentials, at the port the app\'s server is at', function () {
+    const sockets = multiDb.defaultCredentials.postgres.filter(guess => guess.host.startsWith('/'))
+    for (const guess of sockets) assert.ok(['/var/run/postgresql', '/tmp'].includes(guess.host))
+    if (sockets.length) assert.equal(multiDb.defaultCredentials.postgres.indexOf(sockets[0]), 0)
+  })
+})
+
 describe('Loading drivers', function () {
   const loadDriver = require('../lib/loadDriver')
   const appDir = path.join(os.tmpdir(), `multi-db-driver-load-driver-test-${process.pid}`)
