@@ -1,5 +1,6 @@
 const process = require('process')
 const fs = require('fs')
+const os = require('os')
 const isCli = process.argv[1]?.slice(-6) === 'cli.js' // argv[1] is undefined in the repl and under node -e, where there is no script path
 const Logger = require('roosevelt-logger')
 const configFinder = require('./lib/configFinder')
@@ -103,7 +104,7 @@ async function multiDb (params) {
     const credentialsToTry = [configured]
     if (guessCredentials) {
       credentialsToTry.push(
-        ...multiDb.defaultCredentials[name], // try some default credentials if the configured ones don't work
+        ...multiDb.defaultCredentials[name].map(guess => ({ ...guess, port: config[name].config?.port ?? config[name].adminConfig?.port ?? guess.port })), // try some default credentials if the configured ones don't work, at the port the app's server is at, rather than at the default port, where another server could be
         config.admin ? config[name].config : config[name].adminConfig // if none of those worked, try either the admin credentials or the user credentials, whichever wasn't used above
       )
     }
@@ -116,6 +117,7 @@ async function multiDb (params) {
         logger.log(spec.emoji, `${spec.label} database connected with user ${credentials.user} to database ${credentials.database}`)
         db[name].username = credentials.user
         db[name].database = credentials.database
+        db[name].credentials = credentials // which credentials connected, for setting up a database with the same ones. see lib/setup.js
         return true
       } catch (e) {
         failures.push(`user ${credentials.user} on ${credentials.host || 'localhost'}${credentials.port ? ':' + credentials.port : ''}: ${String(e.message || e.code || e).split('\n')[0]}`) // first line only, so the report stays on one line
@@ -569,6 +571,13 @@ multiDb.defaultCredentials = {
     }
   ],
   postgres: [
+    // unix sockets first, which need no password, so they can neither hang nor prompt: a local server's own operating system user, and the user running this, which a developer is often given a role for, can usually connect over one as themselves. linux puts the socket in /var/run/postgresql, and postgres.app and homebrew in /tmp
+    ...['/var/run/postgresql', '/tmp'].filter(dir => fs.existsSync(dir)).flatMap(dir => [...new Set([os.userInfo().username, 'postgres'])].map(user => ({
+      host: dir,
+      port: 5432,
+      user,
+      database: 'postgres'
+    }))),
     {
       host: 'localhost',
       port: 5432,
@@ -606,5 +615,8 @@ multiDb.defaultCredentials = {
     }
   ]
 }
+// setting up an app's database from a script: its user, its database, loading sql into it, and dumping it out. see lib/setup.js
+multiDb.setup = require('./lib/setup')(multiDb)
+
 // constructor; returns a db object
 module.exports = multiDb

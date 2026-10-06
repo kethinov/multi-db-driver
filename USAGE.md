@@ -128,11 +128,11 @@ This module also comes with a `cli.js` file to automate common database setup an
 
 The `cli.js` file supports the following commands:
 
-- `cli.js --create`: Creates the user and database specified in your config if it does not already exist.
+- `cli.js --create`: Creates the user and database specified in your config, dropping them first, then runs your config's `schema` against it, if it has one.
 - `cli.js --destroy`: Drops the user and database specified in your config.
-- `cli.js --file file.sql`: Executes the SQL statements in the specified SQL file. Will attempt to do so using the regular less privileged config by default and will escalate to the admin config only if the less privileged config is unable to connect.
-- `cli.js --dump-schema path/to/schema.sql`: Dumps the connected database's schema to specified SQL file path. Will create file in specified path if it does not already exist.
-- `cli.js --dump-data path/to/schema.sql`: Dumps the connected database's schema and data to specified SQL file path. Will create file in specified path if it does not already exist.
+- `cli.js --file file.sql`: Executes the SQL statements in the specified SQL file against your database, as the regular user. A PostgreSQL, MySQL, or MariaDB file is loaded with `psql` or `mysql` when they are in your PATH, which can load what only they can, such as the `COPY ... FROM stdin` that `pg_dump` writes, and is run through the driver otherwise.
+- `cli.js --dump-schema path/to/schema.sql`: Dumps the connected database's schema to specified SQL file path. The folder has to exist already.
+- `cli.js --dump-data path/to/schema.sql`: Dumps the connected database's schema and data to specified SQL file path. The folder has to exist already. A PostgreSQL dump leaves out the `\restrict` lines that `pg_dump` 17.6 and newer write, so that older versions of `psql` can load it too.
 
 For the dump commands to work, you will need to ensure `pg_dump`, `mysqldump`, and `sqlite3` are in your PATH.
 
@@ -154,6 +154,34 @@ It is recommended that you create npm scripts in your app's package.json file to
 - `npm run db-data-dump -- path/to/schema.sql`: Executes `node [...]/cli.js --dump-data path/to/schema.sql`.
 
 Replace the `[...]` part in the above examples with the path to where your copy of this module resides, e.g. in `node_modules`, lib, `git_modules`, or wherever it happens to be in your app.
+
+## Setting up a database from a script
+
+`multiDb.setup(params)` does what the CLI scripts do, from a script of your own, such as one that sets up more than one database, or backs one up before a deploy. It takes the same params as `multiDb(params)`, and works on your default database. The steps that need an admin connect with your `adminConfig`, guessing others when those cannot connect, as the CLI scripts do, the first time one of them is taken. Loading and dumping use your `config`, and need no admin, so a script that only does those, such as one backing up a database during a deploy, never connects as one:
+
+```javascript
+const multiDb = require('multi-db-driver')
+const setup = await multiDb.setup(config)
+await setup.createUser() // the user in your config, with its password
+await setup.createDatabase() // your config's database, owned by that user
+await setup.load('db/seed.sql')
+await setup.dump('backups/before-deploy.sql')
+await setup.close()
+```
+
+Every step is safe to run again: creating a user or a database that is there already leaves it be, apart from setting the user's password to the one given, and dropping one that is not there does nothing.
+
+- `setup.createUser({ user, password })`: Creates a user, or sets the password of one that is there. Defaults to the user and password in your `config`.
+- `setup.createDatabase({ database, owner })`: Creates a database owned by the user given, and lets that user create things in it. Defaults to the database and user in your `config`.
+- `setup.dropDatabase(database)`: Drops a database, closing any connections to it first. Defaults to your `config`'s.
+- `setup.dropUser(user)`: Drops a user. Defaults to your `config`'s.
+- `setup.userExists(user)` and `setup.databaseOwner(database)`: Whether a user is there, and who owns a database, or `null` when it is not there.
+- `setup.load(file, { database, credentials })`: Runs the SQL in a file against a database, as the user in `credentials`, which defaults to your `config`. See `cli.js --file` for how.
+- `setup.dump(file, { database, credentials, schemaOnly })`: Writes a database's schema and data, or its schema alone, to a file, as the user in `credentials`, which defaults to your `config`. See `cli.js --dump-data` for how.
+- `setup.connectedAs()`: The user, host, and port the admin connection connected with, for saying so.
+- `setup.close()`: Closes the admin connection.
+
+PGlite and SQLite databases are files, with no users, so the user steps do nothing for them, and the database steps create and delete the file. PGlite databases cannot be dumped.
 
 ## Writing schemas in a portable way
 

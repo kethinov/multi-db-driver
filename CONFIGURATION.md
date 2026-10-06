@@ -22,7 +22,7 @@ The following params are available when creating your Multi-DB Driver config fil
 
 - `admin` *[Boolean]*: Force the use of `adminConfig` for your database instead of the regular `config`. Default: `false`.
 
-- `guessCredentials` *[Boolean or String]*: Whether to try a series of common default credentials when the configured credentials cannot connect, then whichever of `config` or `adminConfig` was not tried first. Default: `'development'` for apps, `true` for the CLI scripts.
+- `guessCredentials` *[Boolean or String]*: Whether to try a series of common default credentials when the configured credentials cannot connect, then whichever of `config` or `adminConfig` was not tried first. For PostgreSQL, the first it tries are its unix sockets in `/var/run/postgresql` and `/tmp`, at the port of your server, as the user running the app and as `postgres`, which need no password, and are how an admin connects on most Linux installs, and on Postgres.app and Homebrew. Default: `'development'` for apps, `true` for the CLI scripts and `multiDb.setup()`.
   - Available options:
     - `true`: Always guess.
     - `'development'`: Guess only when the `NODE_ENV` environment variable is set to `development`. An unset `NODE_ENV` counts as not development, so a deployment that forgets to set it does not guess.
